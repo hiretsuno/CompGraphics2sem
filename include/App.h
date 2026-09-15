@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <cstdint>
 #include "D3D12Context.h"
+#include <DirectXMath.h>
 
 class Window;
 class Input;
