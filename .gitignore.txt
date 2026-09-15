@@ -1,0 +1,36 @@
+# Папки сборки CMake (создаются CLion)
+cmake-build-debug/
+cmake-build-release/
+cmake-build-debug-visual-studio/
+cmake-build-*/
+
+# Временные файлы IDE
+.idea/
+.vs/
+*.user
+*.suo
+
+# Бинарники и объектные файлы
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.dll
+*.lib
+*.exp
+
+# Файлы, которые генерирует CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# ОС-специфичное
+Thumbs.db
+.DS_Store
+
+# Возможно, стоит исключить тяжёлые ресурсы (если репозиторий будет тормозить)
+# sponza/sponza.obj
+# sponza/*.png
