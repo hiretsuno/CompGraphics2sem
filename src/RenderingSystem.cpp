@@ -814,9 +814,11 @@ void RenderingSystem::Draw(float dt)
         m_commandList->ResourceBarrier(1, &toRT);
 
         const auto rtv = CurrentBackBufferRTV();
+        const auto dsv = m_gBuffer->GetDsv();
         const float clear[4] = { 0.10f, 0.15f, 0.20f, 1.f };
-        m_commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        m_commandList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         m_commandList->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
 
         m_commandList->RSSetViewports(1, &m_viewport);
         m_commandList->RSSetScissorRects(1, &m_scissorRect);
@@ -826,18 +828,28 @@ void RenderingSystem::Draw(float dt)
         m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
         m_commandList->IASetIndexBuffer(&m_indexBufferView);
 
+        // === БИНДИНГ ТЕКСТУРНОГО HEAP ===
+        ID3D12DescriptorHeap* heaps[] = { m_textureHeap.Get() };
+        m_commandList->SetDescriptorHeaps(1, heaps);
+
         // b0 — ViewProj + Eye + LightDir (per-frame)
         m_commandList->SetGraphicsRootConstantBufferView(0, m_scatterViewCB->GetGPUVirtualAddress());
 
         // Рисуем каждый видимый инстанс
         for (uint32_t idx : m_scatterVisible)
         {
-            const XMFLOAT4X4& w = m_scatterInstances[idx].World;
-            // b1 — 16 root-констант (матрица мира)
-            m_commandList->SetGraphicsRoot32BitConstants(1, 16, &w, 0);
+            // Транспонируем матрицу мира для HLSL (column-major)
+            XMFLOAT4X4 wT;
+            XMStoreFloat4x4(&wT, XMMatrixTranspose(XMLoadFloat4x4(&m_scatterInstances[idx].World)));
+            m_commandList->SetGraphicsRoot32BitConstants(1, 16, &wT, 0);
 
             for (const DrawItem& di : m_drawItems)
             {
+                // t0 — SRV с диффузной текстурой
+                D3D12_GPU_DESCRIPTOR_HANDLE texHandle = m_textureHeap->GetGPUDescriptorHandleForHeapStart();
+                texHandle.ptr += static_cast<UINT64>(di.TextureIndex) * m_srvDescriptorSize;
+                m_commandList->SetGraphicsRootDescriptorTable(2, texHandle);
+
                 m_commandList->DrawIndexedInstanced(
                     di.IndexCount, 1, di.StartIndexLocation, 0, 0);
             }
@@ -1591,9 +1603,10 @@ bool RenderingSystem::BuildScatterResources()
     m_scatterInstances.clear();
     m_scatterInstances.reserve(kScatterInstanceCount);
 
-    const float spacing = 1.5f;
+    const float spacing = 2.0f;        // расстояние между гномами
+    const float modelScale = 1.f;
     const float half = (kScatterGridSide - 1) * 0.5f * spacing;
-    const AABB localBounds{ {-0.8f, 0.f, -0.8f}, {0.8f, 1.6f, 0.8f} };
+    const AABB localBounds{ {-0.1f, 0.f, -0.1f}, {0.1f, 0.15f, 0.1f} };  // реальные размеры модели
 
     for (uint32_t z = 0; z < kScatterGridSide; ++z)
     {
@@ -1603,7 +1616,9 @@ bool RenderingSystem::BuildScatterResources()
             const float pz = z * spacing - half;
 
             ScatterInstance inst{};
-            const XMMATRIX world = XMMatrixTranslation(px, 0.f, pz);
+            // Масштаб ×10 + сдвиг + ТРАНСПОНИРОВАНИЕ для HLSL
+            const XMMATRIX world = XMMatrixScaling(modelScale, modelScale, modelScale)
+                     * XMMatrixTranslation(px, 0.f, pz);
             XMStoreFloat4x4(&inst.World, world);
             inst.WorldBounds = TransformAABB(localBounds, inst.World);
             m_scatterInstances.push_back(inst);
@@ -1657,21 +1672,51 @@ bool RenderingSystem::BuildScatterResources()
     }
 
     // 6. Root signature: b0 = ViewCB (per-frame), b1 = 16 root constants (per-instance world matrix).
+    // 6. Root signature: b0 = ViewCB, b1 = 16 root constants (world matrix), t0 = diffuse SRV.
     {
-        D3D12_ROOT_PARAMETER params[2]{};
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;
+        srvRange.RegisterSpace = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER params[3]{};
 
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
+        params[0].Descriptor.RegisterSpace = 0;
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[1].Constants.ShaderRegister = 1;
-        params[1].Constants.Num32BitValues = 16;   // 4x4 matrix
+        params[1].Constants.RegisterSpace = 0;
+        params[1].Constants.Num32BitValues = 16;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable.NumDescriptorRanges = 1;
+        params[2].DescriptorTable.pDescriptorRanges = &srvRange;
+        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC samp{};
+        samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samp.MipLODBias = 0.f;
+        samp.MaxAnisotropy = 1;
+        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samp.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        samp.MinLOD = 0.f;
+        samp.MaxLOD = D3D12_FLOAT32_MAX;
+        samp.ShaderRegister = 0;
+        samp.RegisterSpace = 0;
+        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
         D3D12_ROOT_SIGNATURE_DESC desc{};
-        desc.NumParameters = 2;
+        desc.NumParameters = 3;
         desc.pParameters = params;
+        desc.NumStaticSamplers = 1;
+        desc.pStaticSamplers = &samp;
         desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> serialized, err;
@@ -1697,7 +1742,9 @@ bool RenderingSystem::BuildScatterResources()
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 
         D3D12_DEPTH_STENCIL_DESC ds{};
-        ds.DepthEnable = FALSE;   // для простоты без depth, чтобы не возиться
+        ds.DepthEnable = TRUE;
+        ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
         pso.pRootSignature = m_scatterRootSig.Get();
@@ -1711,7 +1758,7 @@ bool RenderingSystem::BuildScatterResources()
         pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pso.NumRenderTargets = 1;
         pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        pso.DSVFormat = m_gBuffer->GetDepthStencilFormat();
         pso.SampleDesc.Count = 1;
 
         ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_scatterPSO)), "ScatterPSO");

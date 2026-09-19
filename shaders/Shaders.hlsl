@@ -1,4 +1,3 @@
-
 cbuffer PassCB : register(b0)
 {
     float4x4 gWorld;        // Object-to-world

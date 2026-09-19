@@ -173,7 +173,7 @@ private:
     DirectX::XMFLOAT4X4 m_world{};
     DirectX::XMFLOAT4X4 m_view{};
     DirectX::XMFLOAT4X4 m_proj{};
-    DirectX::XMFLOAT3 m_eyePos{ -5.f, 1.f, -5.f };
+    DirectX::XMFLOAT3 m_eyePos{ -30.f, 25.f, -30.f };
 
     float m_time = 0.f;
     // === Scatter scene ===

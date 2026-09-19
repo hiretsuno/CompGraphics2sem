@@ -5,12 +5,13 @@ cbuffer ViewCB : register(b0)
     float4   gLightDir;
 };
 
-// Per-instance матрица мира через root constants (b1).
-// 16 float = 4 float4 = 64 байта.
 cbuffer InstanceCB : register(b1)
 {
     float4x4 gWorld;
 };
+
+Texture2D    gDiffuseMap : register(t0);
+SamplerState gSampler    : register(s0);
 
 struct VSIn
 {
@@ -30,18 +31,18 @@ VSOut VS(VSIn vin)
 {
     VSOut vout;
     float4 posW = mul(float4(vin.PosL, 1.0), gWorld);
-    vout.PosH   = mul(posW, gViewProj);
+    vout.PosH    = mul(posW, gViewProj);
     vout.NormalW = normalize(mul(vin.NormalL, (float3x3)gWorld));
-    vout.TexC   = vin.TexC;
+    vout.TexC    = vin.TexC;
     return vout;
 }
 
 float4 PS(VSOut pin) : SV_TARGET
 {
-    // Простое ламбертовское освещение для визуализации.
-    float3 N = normalize(pin.NormalW);
-    float3 L = normalize(-gLightDir.xyz);
+    float3 albedo = gDiffuseMap.Sample(gSampler, pin.TexC).rgb;
+    float3 N     = normalize(pin.NormalW);
+    float3 L     = normalize(-gLightDir.xyz);
     float  ndotl = saturate(dot(N, L));
-    float3 color = float3(0.5, 0.4, 0.3) * (0.3 + 0.7 * ndotl);
+    float3 color = albedo * (0.3 + 0.7 * ndotl);
     return float4(color, 1.0);
 }
