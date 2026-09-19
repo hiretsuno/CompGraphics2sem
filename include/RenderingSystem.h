@@ -14,6 +14,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "AABB.h"
+#include "Frustum.h"
+#include "Octree.h"
 
 class GBuffer;
 
@@ -35,6 +38,16 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
+
+    void ToggleSceneMode();          // Tab: переключить cliff ↔ scatter
+    void ToggleFrustumCulling();     // F
+    void ToggleOctreeCulling();      // O
+    bool FrustumCullingOn() const { return m_useFrustumCulling; }
+    bool OctreeCullingOn()  const { return m_useOctreeCulling; }
+    bool ScatterModeOn()    const { return m_sceneMode == 1; }
+    uint32_t ScatterVisibleCount() const { return (uint32_t)m_scatterVisible.size(); }
+    uint32_t ScatterTotalCount()   const { return (uint32_t)m_scatterInstances.size(); }
+
 private:
     struct MaterialConstants
     {
@@ -163,4 +176,33 @@ private:
     DirectX::XMFLOAT3 m_eyePos{ -5.f, 1.f, -5.f };
 
     float m_time = 0.f;
+    // === Scatter scene ===
+    static constexpr uint32_t kScatterGridSide = 32;              // 32x32 = 1024 объекта
+    static constexpr uint32_t kScatterInstanceCount = kScatterGridSide * kScatterGridSide;
+
+    int m_sceneMode = 0;                          // 0 = cliff deferred, 1 = scatter
+    bool m_useFrustumCulling = true;
+    bool m_useOctreeCulling = false;
+
+    struct ScatterInstance
+    {
+        DirectX::XMFLOAT4X4 World;
+        AABB                WorldBounds;
+    };
+    std::vector<ScatterInstance> m_scatterInstances;
+    std::vector<uint32_t>        m_scatterVisible;
+
+    Octree m_scatterOctree;
+    bool   m_scatterOctreeBuilt = false;
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_scatterRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_scatterPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_scatterVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_scatterPS;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatterViewCB;
+    uint8_t* m_mappedScatterViewCB = nullptr;
+
+    bool BuildScatterResources();
+    void BuildScatterInstances();
+    void UpdateScatterVisible();
 };

@@ -714,6 +714,8 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     UpdatePassConstants();
     UpdateLightConstants(0.f);
     BuildPSOs();
+    if (!BuildScatterResources())
+        return false;
 
     m_initialized = true;
     return true;
@@ -746,6 +748,11 @@ void RenderingSystem::Shutdown()
     {
         CloseHandle(m_fenceEvent);
         m_fenceEvent = nullptr;
+    }
+    if (m_scatterViewCB && m_mappedScatterViewCB)
+    {
+        m_scatterViewCB->Unmap(0, nullptr);
+        m_mappedScatterViewCB = nullptr;
     }
 }
 
@@ -789,6 +796,71 @@ void RenderingSystem::Draw(float dt)
     UpdatePassConstants();
     UpdateLightConstants(dt);
 
+    // ================== SCATTER MODE (ЛАБА 4) ==================
+    if (m_sceneMode == 1)
+    {
+        UpdateScatterVisible();
+
+        ThrowIfFailed(m_commandAllocator->Reset(), "Reset allocator (scatter)");
+        ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset list (scatter)");
+
+        // Back buffer: PRESENT → RENDER_TARGET
+        D3D12_RESOURCE_BARRIER toRT{};
+        toRT.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toRT.Transition.pResource   = CurrentBackBuffer();
+        toRT.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        toRT.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toRT.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_commandList->ResourceBarrier(1, &toRT);
+
+        const auto rtv = CurrentBackBufferRTV();
+        const float clear[4] = { 0.10f, 0.15f, 0.20f, 1.f };
+        m_commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        m_commandList->ClearRenderTargetView(rtv, clear, 0, nullptr);
+
+        m_commandList->RSSetViewports(1, &m_viewport);
+        m_commandList->RSSetScissorRects(1, &m_scissorRect);
+        m_commandList->SetGraphicsRootSignature(m_scatterRootSig.Get());
+        m_commandList->SetPipelineState(m_scatterPSO.Get());
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
+        m_commandList->IASetIndexBuffer(&m_indexBufferView);
+
+        // b0 — ViewProj + Eye + LightDir (per-frame)
+        m_commandList->SetGraphicsRootConstantBufferView(0, m_scatterViewCB->GetGPUVirtualAddress());
+
+        // Рисуем каждый видимый инстанс
+        for (uint32_t idx : m_scatterVisible)
+        {
+            const XMFLOAT4X4& w = m_scatterInstances[idx].World;
+            // b1 — 16 root-констант (матрица мира)
+            m_commandList->SetGraphicsRoot32BitConstants(1, 16, &w, 0);
+
+            for (const DrawItem& di : m_drawItems)
+            {
+                m_commandList->DrawIndexedInstanced(
+                    di.IndexCount, 1, di.StartIndexLocation, 0, 0);
+            }
+        }
+
+        // Back buffer: RENDER_TARGET → PRESENT
+        D3D12_RESOURCE_BARRIER toPresent = toRT;
+        toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toPresent.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+        m_commandList->ResourceBarrier(1, &toPresent);
+
+        ThrowIfFailed(m_commandList->Close(), "Close list (scatter)");
+        ID3D12CommandList* lists[] = { m_commandList.Get() };
+        m_commandQueue->ExecuteCommandLists(1, lists);
+
+        ThrowIfFailed(m_swapChain->Present(1, 0), "Present (scatter)");
+        m_backBufferIndex = (m_backBufferIndex + 1) % SwapChainBufferCount;
+        FlushCommandQueue();
+        return;
+    }
+
+    // ================== CLIFF MODE (ЛАБА 3, DEFERRED) ==================
+
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator");
     ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset command list");
 
@@ -796,6 +868,7 @@ void RenderingSystem::Draw(float dt)
     m_commandList->RSSetScissorRects(1, &m_scissorRect);
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
 
+    // --- Geometry pass: пишем в G-buffer ---
     m_gBuffer->TransitionToWrite(m_commandList.Get());
     m_gBuffer->BindForGeometryPass(m_commandList.Get());
 
@@ -816,16 +889,18 @@ void RenderingSystem::Draw(float dt)
 
         m_commandList->SetGraphicsRootDescriptorTable(1, textureHandle);
         m_commandList->SetGraphicsRoot32BitConstants(2, 8, &drawItem.Material, 0);
-        m_commandList->DrawIndexedInstanced(drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
+        m_commandList->DrawIndexedInstanced(
+            drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
     }
 
+    // --- Lighting pass: читаем G-buffer, пишем в back buffer ---
     m_gBuffer->TransitionToRead(m_commandList.Get());
 
     D3D12_RESOURCE_BARRIER toRenderTarget{};
     toRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    toRenderTarget.Transition.pResource = CurrentBackBuffer();
+    toRenderTarget.Transition.pResource   = CurrentBackBuffer();
     toRenderTarget.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    toRenderTarget.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    toRenderTarget.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
     toRenderTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     m_commandList->ResourceBarrier(1, &toRenderTarget);
 
@@ -844,9 +919,10 @@ void RenderingSystem::Draw(float dt)
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->DrawInstanced(3, 1, 0, 0);
 
+    // --- Back buffer: RENDER_TARGET → PRESENT ---
     D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    toPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    toPresent.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     m_commandList->ResourceBarrier(1, &toPresent);
 
     ThrowIfFailed(m_commandList->Close(), "Close command list");
@@ -1144,8 +1220,8 @@ bool RenderingSystem::BuildPSOs()
 bool RenderingSystem::BuildGeometry()
 {
     ObjMesh model{};
-    if (!LoadObj(ResolveAssetPath("models/cliff/namaqualand_cliff_02_4k.obj"), model))
-        throw std::runtime_error("Failed to load model.obj");
+    if (!LoadObj(ResolveAssetPath("models/gnome/gnome.obj"), model))
+        throw std::runtime_error("Failed to load gnome.obj");
 
     std::unordered_map<std::string, uint32_t> pathToIndex;
     std::vector<std::string> uniquePaths;
@@ -1445,6 +1521,257 @@ void RenderingSystem::FlushCommandQueue()
     {
         ThrowIfFailed(m_fence->SetEventOnCompletion(value, m_fenceEvent), "Set fence event");
         WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+}
+// ============================ SCATTER SCENE (ЛАБА 4) ============================
+
+void RenderingSystem::ToggleSceneMode()
+{
+    m_sceneMode = (m_sceneMode + 1) % 2;
+}
+
+void RenderingSystem::ToggleFrustumCulling()
+{
+    m_useFrustumCulling = !m_useFrustumCulling;
+}
+
+void RenderingSystem::ToggleOctreeCulling()
+{
+    m_useOctreeCulling = !m_useOctreeCulling;
+}
+
+void RenderingSystem::BuildScatterInstances()
+{
+    m_scatterInstances.clear();
+    m_scatterInstances.reserve(kScatterInstanceCount);
+
+    // Локальный AABB меша (для тестов фрустумом).
+    AABB localBounds;
+    for (const auto& v : /* s_meshVertices */ std::vector<Vertex>{})
+    {
+        // заглушка, ниже исправим
+    }
+    // --- Ниже заполним нормально после загрузки меша. ---
+
+    // Сетка N×N с шагом spacing.
+    const float spacing = 3.0f;
+    const float half = (kScatterGridSide - 1) * 0.5f * spacing;
+
+    for (uint32_t z = 0; z < kScatterGridSide; ++z)
+    {
+        for (uint32_t x = 0; x < kScatterGridSide; ++x)
+        {
+            const float px = x * spacing - half;
+            const float pz = z * spacing - half;
+
+            ScatterInstance inst{};
+            const XMMATRIX world = XMMatrixTranslation(px, 0.f, pz);
+            XMStoreFloat4x4(&inst.World, world);
+            inst.WorldBounds = TransformAABB(localBounds, inst.World);
+            m_scatterInstances.push_back(inst);
+        }
+    }
+}
+
+bool RenderingSystem::BuildScatterResources()
+{
+    // 1. Загрузка меша для scatter (можно тот же cliff или другой).
+    // Используем уже загруженный m_drawItems и m_vertexBuffer/m_indexBuffer.
+    if (m_drawItems.empty())
+        return false;
+
+    // 2. Локальный AABB — построим из первой группы (грубо, по позиции).
+    // Для точности нужно обойти все вершины, но для лабы сойдёт bounding-сфера.
+
+    // 3. Инстансы.
+    // Локальный AABB меша мы получим, если LoadObj сохранит его — у тебя нет.
+    // Сделаем упрощённо: localBounds = {-1, -1, -1, 1, 1, 1} * scale.
+
+    // --- Строим инстансы ---
+    m_scatterInstances.clear();
+    m_scatterInstances.reserve(kScatterInstanceCount);
+
+    const float spacing = 1.5f;
+    const float half = (kScatterGridSide - 1) * 0.5f * spacing;
+    const AABB localBounds{ {-0.8f, 0.f, -0.8f}, {0.8f, 1.6f, 0.8f} };
+
+    for (uint32_t z = 0; z < kScatterGridSide; ++z)
+    {
+        for (uint32_t x = 0; x < kScatterGridSide; ++x)
+        {
+            const float px = x * spacing - half;
+            const float pz = z * spacing - half;
+
+            ScatterInstance inst{};
+            const XMMATRIX world = XMMatrixTranslation(px, 0.f, pz);
+            XMStoreFloat4x4(&inst.World, world);
+            inst.WorldBounds = TransformAABB(localBounds, inst.World);
+            m_scatterInstances.push_back(inst);
+        }
+    }
+
+    // 4. Octree.
+    std::vector<AABB> worldBounds;
+    worldBounds.reserve(m_scatterInstances.size());
+    for (const auto& inst : m_scatterInstances)
+        worldBounds.push_back(inst.WorldBounds);
+
+    AABB sceneBounds = worldBounds[0];
+    for (const auto& b : worldBounds)
+    {
+        sceneBounds.Min.x = std::min(sceneBounds.Min.x, b.Min.x);
+        sceneBounds.Min.y = std::min(sceneBounds.Min.y, b.Min.y);
+        sceneBounds.Min.z = std::min(sceneBounds.Min.z, b.Min.z);
+        sceneBounds.Max.x = std::max(sceneBounds.Max.x, b.Max.x);
+        sceneBounds.Max.y = std::max(sceneBounds.Max.y, b.Max.y);
+        sceneBounds.Max.z = std::max(sceneBounds.Max.z, b.Max.z);
+    }
+    sceneBounds.Min.x -= 1.f; sceneBounds.Min.y -= 1.f; sceneBounds.Min.z -= 1.f;
+    sceneBounds.Max.x += 1.f; sceneBounds.Max.y += 1.f; sceneBounds.Max.z += 1.f;
+
+    m_scatterOctree.Build(worldBounds, sceneBounds, 6, 8);
+    m_scatterOctreeBuilt = true;
+
+    // 5. Шейдеры.
+    {
+        UINT flags = 0;
+#if defined(_DEBUG)
+        flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+        ComPtr<ID3DBlob> errors;
+        const std::wstring sp = ToWide(ResolveAssetPath("shaders/ScatterScene.hlsl"));
+
+        auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& blob)
+        {
+            errors.Reset();
+            HRESULT hr = D3DCompileFromFile(sp.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                entry, target, flags, 0, &blob, &errors);
+            if (FAILED(hr))
+            {
+                if (errors) throw std::runtime_error((const char*)errors->GetBufferPointer());
+                ThrowIfFailed(hr, entry);
+            }
+        };
+        compile("VS", "vs_5_0", m_scatterVS);
+        compile("PS", "ps_5_0", m_scatterPS);
+    }
+
+    // 6. Root signature: b0 = ViewCB (per-frame), b1 = 16 root constants (per-instance world matrix).
+    {
+        D3D12_ROOT_PARAMETER params[2]{};
+
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.ShaderRegister = 1;
+        params[1].Constants.Num32BitValues = 16;   // 4x4 matrix
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+        D3D12_ROOT_SIGNATURE_DESC desc{};
+        desc.NumParameters = 2;
+        desc.pParameters = params;
+        desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> serialized, err;
+        HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &err);
+        if (FAILED(hr))
+        {
+            if (err) throw std::runtime_error((const char*)err->GetBufferPointer());
+            ThrowIfFailed(hr, "SerializeScatterRS");
+        }
+        ThrowIfFailed(m_device->CreateRootSignature(0, serialized->GetBufferPointer(),
+            serialized->GetBufferSize(), IID_PPV_ARGS(&m_scatterRootSig)), "ScatterRS");
+    }
+
+    // 7. PSO.
+    {
+        D3D12_RASTERIZER_DESC rast{};
+        rast.FillMode = D3D12_FILL_MODE_SOLID;
+        rast.CullMode = D3D12_CULL_MODE_BACK;
+        rast.FrontCounterClockwise = TRUE;
+        rast.DepthClipEnable = TRUE;
+
+        D3D12_BLEND_DESC blend{};
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        D3D12_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable = FALSE;   // для простоты без depth, чтобы не возиться
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+        pso.pRootSignature = m_scatterRootSig.Get();
+        pso.VS = { m_scatterVS->GetBufferPointer(), m_scatterVS->GetBufferSize() };
+        pso.PS = { m_scatterPS->GetBufferPointer(), m_scatterPS->GetBufferSize() };
+        pso.BlendState = blend;
+        pso.SampleMask = UINT_MAX;
+        pso.RasterizerState = rast;
+        pso.DepthStencilState = ds;
+        pso.InputLayout = { m_inputLayout, 3 };  // POSITION, NORMAL, TEXCOORD
+        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets = 1;
+        pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        pso.SampleDesc.Count = 1;
+
+        ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_scatterPSO)), "ScatterPSO");
+    }
+
+    // 8. Per-frame CB (ViewProj + Eye + LightDir).
+    {
+        auto upHeap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        struct ScatterViewCB { XMFLOAT4X4 ViewProj; XMFLOAT4 Eye; XMFLOAT4 LightDir; };
+        const uint32_t sz = AlignConstantBufferSize(sizeof(ScatterViewCB));
+        const auto desc = BufferDesc(sz);
+        ThrowIfFailed(m_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_scatterViewCB)), "ScatterViewCB");
+        D3D12_RANGE rr{0,0};
+        ThrowIfFailed(m_scatterViewCB->Map(0, &rr, reinterpret_cast<void**>(&m_mappedScatterViewCB)), "Map ScatterViewCB");
+    }
+
+    return true;
+}
+
+void RenderingSystem::UpdateScatterVisible()
+{
+    // Обновляем per-frame CB.
+    struct ScatterViewCB { XMFLOAT4X4 ViewProj; XMFLOAT4 Eye; XMFLOAT4 LightDir; };
+    ScatterViewCB cb{};
+    const XMMATRIX vp = XMLoadFloat4x4(&m_view) * XMLoadFloat4x4(&m_proj);
+    XMStoreFloat4x4(&cb.ViewProj, XMMatrixTranspose(vp));
+    cb.Eye = { m_eyePos.x, m_eyePos.y, m_eyePos.z, 1.f };
+    cb.LightDir = { 0.4f, -1.f, 0.3f, 0.f };
+    std::memcpy(m_mappedScatterViewCB, &cb, sizeof(cb));
+
+    // Собираем видимые инстансы.
+    if (!m_useFrustumCulling)
+    {
+        m_scatterVisible.clear();
+        m_scatterVisible.reserve(m_scatterInstances.size());
+        for (uint32_t i = 0; i < (uint32_t)m_scatterInstances.size(); ++i)
+            m_scatterVisible.push_back(i);
+        return;
+    }
+
+    Frustum f = Frustum::FromViewProj(cb.ViewProj);  // ВНИМАНИЕ: cb.ViewProj транспонирован!
+
+    // Хм, тут надо передавать нетранспонированный VP.
+    // Исправим: считаем Frustum из оригинальной (не транспонированной) матрицы.
+    XMFLOAT4X4 vpOrig;
+    XMStoreFloat4x4(&vpOrig, vp);  // здесь vpOrig = view*proj (не транспонированный)
+    f = Frustum::FromViewProj(vpOrig);
+
+    if (m_useOctreeCulling && m_scatterOctreeBuilt)
+    {
+        m_scatterOctree.QueryVisible(f, m_scatterVisible);
+    }
+    else
+    {
+        m_scatterVisible.clear();
+        m_scatterVisible.reserve(m_scatterInstances.size());
+        for (uint32_t i = 0; i < (uint32_t)m_scatterInstances.size(); ++i)
+            if (f.Intersects(m_scatterInstances[i].WorldBounds))
+                m_scatterVisible.push_back(i);
     }
 }
 
