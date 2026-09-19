@@ -118,7 +118,10 @@ namespace
             JoinPath(exeDir, name),
             JoinPath(JoinPath(exeDir, "assets"), name),
             JoinPath("..", name),
-            JoinPath("../..", name)
+            JoinPath("../..", name),
+            JoinPath("models", name),
+            JoinPath("sponza", name),
+            JoinPath("shaders", name),
         };
 
         for (const auto& candidate : candidates)
@@ -693,7 +696,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_viewport = { 0.f, 0.f, static_cast<float>(m_width), static_cast<float>(m_height), 0.f, 1.f };
     m_scissorRect = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
 
-    XMStoreFloat4x4(&m_world, XMMatrixScaling(0.01f, 0.01f, 0.01f));
+    XMStoreFloat4x4(&m_world, XMMatrixScaling(1.f, 1.f, 1.f));
     SetCamera(m_eyePos, 1.f, 0.f);
 
     const float aspect = (m_height > 0) ? static_cast<float>(m_width) / static_cast<float>(m_height) : 1.f;
@@ -1141,8 +1144,8 @@ bool RenderingSystem::BuildPSOs()
 bool RenderingSystem::BuildGeometry()
 {
     ObjMesh model{};
-    if (!LoadObj(ResolveAssetPath("sponza/sponza.obj"), model))
-        throw std::runtime_error("Failed to load sponza.obj");
+    if (!LoadObj(ResolveAssetPath("models/cliff/namaqualand_cliff_02_4k.obj"), model))
+        throw std::runtime_error("Failed to load model.obj");
 
     std::unordered_map<std::string, uint32_t> pathToIndex;
     std::vector<std::string> uniquePaths;
@@ -1368,7 +1371,7 @@ void RenderingSystem::UpdateLightConstants(float dt)
     m_time += dt;
 
     LightConstants constants{};
-    constants.AmbientColor = XMFLOAT4(0.055f, 0.055f, 0.06f, 1.f);
+    constants.AmbientColor = XMFLOAT4(0.8f, 0.8f, 0.8f, 1.f);
 
     const uint32_t lightCount = static_cast<uint32_t>(std::min<size_t>(m_sceneLights.size(), MaxLights));
     constants.LightCount = XMFLOAT4(static_cast<float>(lightCount), 0.f, 0.f, 0.f);
@@ -1432,24 +1435,6 @@ void RenderingSystem::CreateSceneLights()
 
     m_sceneLights.clear();
 
-    // Directional сини
-    m_sceneLights.push_back(makeDirectional(
-        XMFLOAT3(0.4f, -1.f, 0.3f),
-        XMFLOAT3(0.6f, 0.6f, 1.0f),
-        2.f));
-
-    // point красни
-    m_sceneLights.push_back(makePoint(
-        XMFLOAT3(11.0f, 2.0f, -0.3f),
-        XMFLOAT3(1.0f, 0.1f, 0.1f),
-        3.5f, 4.5f));
-
-    // зелёный spot 
-    m_sceneLights.push_back(makeSpot(
-        XMFLOAT3(-10.f, 16.3f, -0.4f),
-        XMFLOAT3(0.6f, -1.0f, 0.f),
-        XMFLOAT3(0.2f, 1.0f, 0.2f),
-        7.0f, 19.0f, 7.0f, 19.0f));
 }
 
 void RenderingSystem::FlushCommandQueue()
