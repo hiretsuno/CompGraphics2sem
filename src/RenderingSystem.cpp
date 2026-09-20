@@ -700,7 +700,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     SetCamera(m_eyePos, 1.f, 0.f);
 
     const float aspect = (m_height > 0) ? static_cast<float>(m_width) / static_cast<float>(m_height) : 1.f;
-    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 1000.f));
+    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 200.f));
 
     BuildShaders();
     BuildRootSignature();
@@ -783,7 +783,7 @@ void RenderingSystem::OnResize(uint32_t width, uint32_t height)
     m_scissorRect = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
 
     const float aspect = static_cast<float>(m_width) / static_cast<float>(m_height);
-    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 1000.f));
+    XMStoreFloat4x4(&m_proj, XMMatrixPerspectiveFovLH(0.25f * XM_PI, aspect, 0.05f, 200.f));
 
     UpdatePassConstants();
 }
@@ -1617,8 +1617,10 @@ bool RenderingSystem::BuildScatterResources()
 
             ScatterInstance inst{};
             // Масштаб ×10 + сдвиг + ТРАНСПОНИРОВАНИЕ для HLSL
+            const float yaw = (float)(rand() % 628) * 0.01f;  // 0..2π
             const XMMATRIX world = XMMatrixScaling(modelScale, modelScale, modelScale)
-                     * XMMatrixTranslation(px, 0.f, pz);
+                                 * XMMatrixRotationY(yaw)
+                                 * XMMatrixTranslation(px, 0.f, pz);
             XMStoreFloat4x4(&inst.World, world);
             inst.WorldBounds = TransformAABB(localBounds, inst.World);
             m_scatterInstances.push_back(inst);
@@ -1700,14 +1702,14 @@ bool RenderingSystem::BuildScatterResources()
         params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC samp{};
-        samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        samp.MipLODBias = 0.f;
-        samp.MaxAnisotropy = 1;
-        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        samp.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+        samp.Filter = D3D12_FILTER_ANISOTROPIC;
+        samp.MaxAnisotropy = 9;
         samp.MinLOD = 0.f;
         samp.MaxLOD = D3D12_FLOAT32_MAX;
+        samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samp.MipLODBias = 0.f;
+        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samp.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
         samp.ShaderRegister = 0;
         samp.RegisterSpace = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
