@@ -1,6 +1,7 @@
 #include "RenderingSystem.h"
 #include "GBuffer.h"
 #include "ShadowMap.h"
+#include "ParticleSystem.h"
 RenderingSystem::RenderingSystem() = default;
 RenderingSystem::~RenderingSystem() = default;
 
@@ -771,6 +772,9 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     m_shadowMap = std::make_unique<ShadowMap>();
     m_shadowMap->Initialize(m_device.Get(), m_gBuffer->GetShadowSrvCpu());
 
+    m_particles = std::make_unique<ParticleSystem>();
+    m_particles->Initialize(m_device.Get(), m_commandQueue.Get(), ToWide(ResolveAssetPath("shaders/ParticleCS.hlsl")));
+
     CreateSceneLights();
     UpdatePassConstants();
     UpdateLightConstants(0.f);
@@ -795,6 +799,12 @@ void RenderingSystem::Shutdown()
     {
         m_lightConstantBuffer->Unmap(0, nullptr);
         m_mappedLightConstants = nullptr;
+    }
+
+    if (m_particles)
+    {
+        m_particles->Shutdown();
+        m_particles.reset();
     }
 
     if (m_shadowMap)
@@ -859,10 +869,14 @@ void RenderingSystem::Draw(float dt)
     const float aspect = static_cast<float>(m_width) / static_cast<float>(m_height);
     m_shadowMap->UpdateCascades(m_view, kFovY, aspect, kNearZ, kShadowDistance, m_sunDir);
 
-    // ================== DEFERRED: Sponza ==================
 
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator");
     ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset command list");
+
+    // --- Particle compute pass: обновить частицы и родить новые (всё на GPU) ---
+    // Барьеры UAV -> vertex buffer / indirect args делает PrepareDraw; сама отрисовка — после lighting pass.
+    m_particles->Simulate(m_commandList.Get(), dt);
+    m_particles->PrepareDraw(m_commandList.Get());
 
     m_commandList->RSSetViewports(1, &m_viewport);
     m_commandList->RSSetScissorRects(1, &m_scissorRect);
@@ -895,7 +909,7 @@ void RenderingSystem::Draw(float dt)
 
     m_shadowMap->TransitionToRead(m_commandList.Get());
 
-    // --- Geometry pass: пишем в G-buffer ---
+    //Geometry pass: пишем в G-buffer
     m_commandList->RSSetViewports(1, &m_viewport);
     m_commandList->RSSetScissorRects(1, &m_scissorRect);
     m_gBuffer->TransitionToWrite(m_commandList.Get());
@@ -922,7 +936,7 @@ void RenderingSystem::Draw(float dt)
             drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
     }
 
-    // --- Lighting pass: читаем G-buffer, пишем в back buffer ---
+    //Lighting pass: читаем G-buffer, пишем в back buffer
     m_gBuffer->TransitionToRead(m_commandList.Get());
 
     D3D12_RESOURCE_BARRIER toRenderTarget{};
@@ -946,14 +960,31 @@ void RenderingSystem::Draw(float dt)
     ID3D12DescriptorHeap* lightingHeaps[] = { m_gBuffer->GetSrvHeap() };
     m_commandList->SetDescriptorHeaps(1, lightingHeaps);
     m_commandList->SetGraphicsRootDescriptorTable(4, m_gBuffer->GetSrvTable());
+    // Таблица текстур (param 1) осталась от geometry pass и указывает в другую кучу. Lighting-шейдер её не читает,
+    // но debug layer требует, чтобы она указывала в текущую кучу — даём любой валидный дескриптор из неё.
+    m_commandList->SetGraphicsRootDescriptorTable(1, m_gBuffer->GetSrvTable());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->DrawInstanced(3, 1, 0, 0);
 
-    // --- Back buffer: RENDER_TARGET → PRESENT ---
+    //Particle render pass: точки -> GS-билборды, depth-тест по глубине сцены
+    const D3D12_CPU_DESCRIPTOR_HANDLE sceneDsv = m_gBuffer->GetDsv();
+    m_commandList->OMSetRenderTargets(1, &backBufferRtv, FALSE, &sceneDsv);
+    m_commandList->SetPipelineState(m_particlePSO.Get());
+    m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+    const D3D12_VERTEX_BUFFER_VIEW particleVbv = m_particles->GetVertexBufferView();
+    m_commandList->IASetVertexBuffers(0, 1, &particleVbv);
+    // Сколько точек рисовать — знает только GPU (счётчик в буфере аргументов), поэтому ExecuteIndirect.
+    m_commandList->ExecuteIndirect(m_particles->GetDrawSignature(), 1, m_particles->GetIndirectArgs(), 0, nullptr, 0);
+
+    // Back buffer: RENDER_TARGET → PRESENT
     D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     toPresent.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     m_commandList->ResourceBarrier(1, &toPresent);
+
+    // Буфер частиц обратно в UAV, consume/append меняются ролями.
+    m_particles->FinishFrame(m_commandList.Get());
 
     ThrowIfFailed(m_commandList->Close(), "Close command list");
     ID3D12CommandList* lists[] = { m_commandList.Get() };
@@ -1082,6 +1113,24 @@ bool RenderingSystem::BuildShaders()
     compile("LightingVS", "vs_5_0", m_lightingVS);
     compile("LightingPS", "ps_5_0", m_lightingPS);
     compile("ShadowVS", "vs_5_0", m_shadowVS);
+
+    // Шейдеры частиц лежат в отдельном файле: VS + GS + PS.
+    const std::wstring particlePath = ToWide(ResolveAssetPath("shaders/ParticleRender.hlsl"));
+    auto compileParticle = [&](const char* entryPoint, const char* target, ComPtr<ID3DBlob>& bytecode)
+    {
+        errors.Reset();
+        const HRESULT hr = D3DCompileFromFile(particlePath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            entryPoint, target, compileFlags, 0, &bytecode, &errors);
+        if (FAILED(hr))
+        {
+            if (errors)
+                throw std::runtime_error(static_cast<const char*>(errors->GetBufferPointer()));
+            ThrowIfFailed(hr, entryPoint);
+        }
+    };
+    compileParticle("ParticleVS", "vs_5_0", m_particleVS);
+    compileParticle("ParticleGS", "gs_5_0", m_particleGS);
+    compileParticle("ParticlePS", "ps_5_0", m_particlePS);
 
     m_inputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[1] = { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
@@ -1296,6 +1345,35 @@ bool RenderingSystem::BuildPSOs()
     shadowPso.SampleDesc.Count = 1;
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&shadowPso, IID_PPV_ARGS(&m_shadowPSO)), "Create shadow PSO");
 
+    // Частицы: рисуются ПОСЛЕ освещения прямо в back buffer, но с depth-тестом по глубине Sponza
+    // (общий depth buffer G-buffer'а). Непрозрачные: без блендинга, с обычной записью в Z.
+    // На вход идут точки (POINTLIST), геометрический шейдер разворачивает их в квадраты.
+    const D3D12_INPUT_ELEMENT_DESC particleLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "SIZE",     0, DXGI_FORMAT_R32_FLOAT,       0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "VELOCITY", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "LIFETIME", 0, DXGI_FORMAT_R32_FLOAT,       0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_RASTERIZER_DESC particleRaster = rasterizer;    // CULL_NONE: квадрат виден с любой стороны
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC particlePso{};
+    particlePso.pRootSignature = m_rootSignature.Get();   // нужен только PassCB (b0)
+    particlePso.VS = { m_particleVS->GetBufferPointer(), m_particleVS->GetBufferSize() };
+    particlePso.GS = { m_particleGS->GetBufferPointer(), m_particleGS->GetBufferSize() };
+    particlePso.PS = { m_particlePS->GetBufferPointer(), m_particlePS->GetBufferSize() };
+    particlePso.BlendState = blend;
+    particlePso.SampleMask = UINT_MAX;
+    particlePso.RasterizerState = particleRaster;
+    particlePso.DepthStencilState = geometryDepth;        // depth test LESS + запись в Z
+    particlePso.InputLayout = { particleLayout, static_cast<UINT>(_countof(particleLayout)) };
+    particlePso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    particlePso.NumRenderTargets = 1;
+    particlePso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    particlePso.DSVFormat = m_gBuffer->GetDepthStencilFormat();
+    particlePso.SampleDesc.Count = 1;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&particlePso, IID_PPV_ARGS(&m_particlePSO)), "Create particle PSO");
+
     return true;
 }
 
@@ -1355,8 +1433,8 @@ bool RenderingSystem::BuildGeometry()
             "Create default buffer");
     };
 
-    createBuffer(vbSize, D3D12_RESOURCE_STATE_COPY_DEST, m_vertexBuffer);
-    createBuffer(ibSize, D3D12_RESOURCE_STATE_COPY_DEST, m_indexBuffer);
+    createBuffer(vbSize, D3D12_RESOURCE_STATE_COMMON, m_vertexBuffer);   // буферы всегда стартуют в COMMON
+    createBuffer(ibSize, D3D12_RESOURCE_STATE_COMMON, m_indexBuffer);
 
     auto createUploadBuffer = [&](UINT64 size, const void* data) -> ComPtr<ID3D12Resource>
     {

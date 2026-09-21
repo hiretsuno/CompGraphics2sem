@@ -17,6 +17,7 @@
 
 class GBuffer;
 class ShadowMap;
+class ParticleSystem;
 
 class RenderingSystem
 {
@@ -139,17 +140,22 @@ private:
 
     std::unique_ptr<GBuffer> m_gBuffer;
     std::unique_ptr<ShadowMap> m_shadowMap;   // CSM: Texture2DArray глубины
+    std::unique_ptr<ParticleSystem> m_particles;   // GPU-частицы (Append/Consume ping-pong)
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowPSO;   // depth-only проход в каскады
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_particlePSO; // частицы: VS + GS + PS, POINTLIST
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingPS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_shadowVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleGS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particlePS;
 
     D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
 
