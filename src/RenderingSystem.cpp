@@ -1235,6 +1235,10 @@ bool RenderingSystem::BuildGeometry()
     if (!LoadObj(ResolveAssetPath("models/gnome/gnome.obj"), model))
         throw std::runtime_error("Failed to load gnome.obj");
 
+    m_meshBounds = AABB{};
+    for (const Vertex& v : model.vertices)
+        m_meshBounds.Expand(v.Pos);
+
     std::unordered_map<std::string, uint32_t> pathToIndex;
     std::vector<std::string> uniquePaths;
 
@@ -1535,7 +1539,6 @@ void RenderingSystem::FlushCommandQueue()
         WaitForSingleObject(m_fenceEvent, INFINITE);
     }
 }
-// ============================ SCATTER SCENE (ЛАБА 4) ============================
 
 void RenderingSystem::ToggleSceneMode()
 {
@@ -1544,69 +1547,33 @@ void RenderingSystem::ToggleSceneMode()
 
 void RenderingSystem::ToggleFrustumCulling()
 {
+    // Режимы взаимоисключающие: F = линейное отсечение, O = окто-дерево.
+    // Оба выключены = рисуем все модели без отсечения.
     m_useFrustumCulling = !m_useFrustumCulling;
+    if (m_useFrustumCulling)
+        m_useOctreeCulling = false;
 }
 
 void RenderingSystem::ToggleOctreeCulling()
 {
     m_useOctreeCulling = !m_useOctreeCulling;
-}
-
-void RenderingSystem::BuildScatterInstances()
-{
-    m_scatterInstances.clear();
-    m_scatterInstances.reserve(kScatterInstanceCount);
-
-    // Локальный AABB меша (для тестов фрустумом).
-    AABB localBounds;
-    for (const auto& v : /* s_meshVertices */ std::vector<Vertex>{})
-    {
-        // заглушка, ниже исправим
-    }
-    // --- Ниже заполним нормально после загрузки меша. ---
-
-    // Сетка N×N с шагом spacing.
-    const float spacing = 3.0f;
-    const float half = (kScatterGridSide - 1) * 0.5f * spacing;
-
-    for (uint32_t z = 0; z < kScatterGridSide; ++z)
-    {
-        for (uint32_t x = 0; x < kScatterGridSide; ++x)
-        {
-            const float px = x * spacing - half;
-            const float pz = z * spacing - half;
-
-            ScatterInstance inst{};
-            const XMMATRIX world = XMMatrixTranslation(px, 0.f, pz);
-            XMStoreFloat4x4(&inst.World, world);
-            inst.WorldBounds = TransformAABB(localBounds, inst.World);
-            m_scatterInstances.push_back(inst);
-        }
-    }
+    if (m_useOctreeCulling)
+        m_useFrustumCulling = false;
 }
 
 bool RenderingSystem::BuildScatterResources()
 {
-    // 1. Загрузка меша для scatter (можно тот же cliff или другой).
-    // Используем уже загруженный m_drawItems и m_vertexBuffer/m_indexBuffer.
     if (m_drawItems.empty())
         return false;
 
-    // 2. Локальный AABB — построим из первой группы (грубо, по позиции).
-    // Для точности нужно обойти все вершины, но для лабы сойдёт bounding-сфера.
-
-    // 3. Инстансы.
-    // Локальный AABB меша мы получим, если LoadObj сохранит его — у тебя нет.
-    // Сделаем упрощённо: localBounds = {-1, -1, -1, 1, 1, 1} * scale.
-
-    // --- Строим инстансы ---
+    //Строим инстансы
     m_scatterInstances.clear();
     m_scatterInstances.reserve(kScatterInstanceCount);
 
     const float spacing = 2.0f;        // расстояние между гномами
     const float modelScale = 1.f;
     const float half = (kScatterGridSide - 1) * 0.5f * spacing;
-    const AABB localBounds{ {-0.1f, 0.f, -0.1f}, {0.1f, 0.15f, 0.1f} };  // реальные размеры модели
+    const AABB localBounds = m_meshBounds;  // реальный AABB меша, посчитан по вершинам
 
     for (uint32_t z = 0; z < kScatterGridSide; ++z)
     {
@@ -1737,7 +1704,9 @@ bool RenderingSystem::BuildScatterResources()
         D3D12_RASTERIZER_DESC rast{};
         rast.FillMode = D3D12_FILL_MODE_SOLID;
         rast.CullMode = D3D12_CULL_MODE_BACK;
-        rast.FrontCounterClockwise = TRUE;
+        // OBJ из Blender: грани CCW в правой системе. В левой системе D3D (LookToLH)
+        // те же числа дают CW на экране, поэтому лицевые грани = по часовой (FALSE).
+        rast.FrontCounterClockwise = FALSE;
         rast.DepthClipEnable = TRUE;
 
         D3D12_BLEND_DESC blend{};
@@ -1792,32 +1761,29 @@ void RenderingSystem::UpdateScatterVisible()
     cb.LightDir = { 0.4f, -1.f, 0.3f, 0.f };
     std::memcpy(m_mappedScatterViewCB, &cb, sizeof(cb));
 
-    // Собираем видимые инстансы.
-    if (!m_useFrustumCulling)
+    // Режим 1: без отсечения — рисуем всё.
+    if (!m_useFrustumCulling && !m_useOctreeCulling)
     {
         m_scatterVisible.clear();
-        m_scatterVisible.reserve(m_scatterInstances.size());
         for (uint32_t i = 0; i < (uint32_t)m_scatterInstances.size(); ++i)
             m_scatterVisible.push_back(i);
         return;
     }
 
-    Frustum f = Frustum::FromViewProj(cb.ViewProj);  // ВНИМАНИЕ: cb.ViewProj транспонирован!
-
-    // Хм, тут надо передавать нетранспонированный VP.
-    // Исправим: считаем Frustum из оригинальной (не транспонированной) матрицы.
-    XMFLOAT4X4 vpOrig;
-    XMStoreFloat4x4(&vpOrig, vp);  // здесь vpOrig = view*proj (не транспонированный)
-    f = Frustum::FromViewProj(vpOrig);
+    // Плоскости берём из НЕтранспонированной View*Proj (транспонирована только копия для HLSL).
+    XMFLOAT4X4 vpCpu;
+    XMStoreFloat4x4(&vpCpu, vp);
+    const Frustum f = Frustum::FromViewProj(vpCpu);
 
     if (m_useOctreeCulling && m_scatterOctreeBuilt)
     {
+        // Режим 3: обход окто-дерева.
         m_scatterOctree.QueryVisible(f, m_scatterVisible);
     }
     else
     {
+        // Режим 2: линейный перебор.
         m_scatterVisible.clear();
-        m_scatterVisible.reserve(m_scatterInstances.size());
         for (uint32_t i = 0; i < (uint32_t)m_scatterInstances.size(); ++i)
             if (f.Intersects(m_scatterInstances[i].WorldBounds))
                 m_scatterVisible.push_back(i);

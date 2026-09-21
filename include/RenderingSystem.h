@@ -202,7 +202,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_scatterViewCB;
     uint8_t* m_mappedScatterViewCB = nullptr;
 
+    AABB m_meshBounds;   // локальный AABB меша гнома (считается по вершинам)
+
     bool BuildScatterResources();
-    void BuildScatterInstances();
     void UpdateScatterVisible();
 };
