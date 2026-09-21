@@ -91,23 +91,6 @@ void App::Update(float dt)
         SetCursorPos(centerScreen.x, centerScreen.y);
 
     }
-    static bool tabPrev = false, fPrev = false, oPrev = false;
-
-    bool tabNow = m_input->IsKeyDown(VK_TAB);
-    if (tabNow && !tabPrev)
-        m_dx12->ToggleSceneMode();
-    tabPrev = tabNow;
-
-    bool fNow = m_input->IsKeyDown('F');
-    if (fNow && !fPrev)
-        m_dx12->ToggleFrustumCulling();
-    fPrev = fNow;
-
-    bool oNow = m_input->IsKeyDown('O');
-    if (oNow && !oPrev)
-        m_dx12->ToggleOctreeCulling();
-    oPrev = oNow;
-
     float speed = m_input->IsKeyDown(VK_SHIFT) ? 12.f : 5.f;
 
     XMVECTOR fwd = XMVector3Normalize(XMVectorSet(sinf(m_camYaw), 0, cosf(m_camYaw), 0));
@@ -129,18 +112,6 @@ void App::Update(float dt)
         XMStoreFloat3(&m_camPos, pos);
     }
 
-    static int frameCounter = 0;
-    if (++frameCounter % 30 == 0)   // раз в 30 кадров, чтобы не дёргалось
-    {
-        wchar_t buf[256];
-        swprintf_s(buf, L"Lab-4 | %s | F: %s | O: %s | Vis: %u/%u",
-            m_dx12->ScatterModeOn() ? L"Scatter" : L"Cliff",
-            m_dx12->FrustumCullingOn() ? L"ON" : L"OFF",
-            m_dx12->OctreeCullingOn()  ? L"ON" : L"OFF",
-            m_dx12->ScatterVisibleCount(),
-            m_dx12->ScatterTotalCount());
-        SetWindowTextW(m_window->GetHwnd(), buf);
-    }
     m_dx12->SetCamera(m_camPos, m_camYaw, m_camPitch);
 }
 

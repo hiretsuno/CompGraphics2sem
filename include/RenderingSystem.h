@@ -14,11 +14,9 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include "AABB.h"
-#include "Frustum.h"
-#include "Octree.h"
 
 class GBuffer;
+class ShadowMap;
 
 class RenderingSystem
 {
@@ -38,15 +36,6 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
-
-    void ToggleSceneMode();          // Tab: переключить cliff ↔ scatter
-    void ToggleFrustumCulling();     // F
-    void ToggleOctreeCulling();      // O
-    bool FrustumCullingOn() const { return m_useFrustumCulling; }
-    bool OctreeCullingOn()  const { return m_useOctreeCulling; }
-    bool ScatterModeOn()    const { return m_sceneMode == 1; }
-    uint32_t ScatterVisibleCount() const { return (uint32_t)m_scatterVisible.size(); }
-    uint32_t ScatterTotalCount()   const { return (uint32_t)m_scatterInstances.size(); }
 
 private:
     struct MaterialConstants
@@ -114,6 +103,12 @@ private:
 private:
     static constexpr uint32_t SwapChainBufferCount = 2;
 
+    // Параметры камеры (нужны и для proj, и для расчёта каскадов).
+    static constexpr float kFovY = 0.25f * DirectX::XM_PI;
+    static constexpr float kNearZ = 0.05f;
+    static constexpr float kFarZ = 200.f;
+    static constexpr float kShadowDistance = 60.f;   // до какого расстояния от камеры строим тени
+
     bool m_initialized = false;
     HWND m_hwnd = nullptr;
     uint32_t m_width = 0;
@@ -143,15 +138,18 @@ private:
     D3D12_RECT m_scissorRect{};
 
     std::unique_ptr<GBuffer> m_gBuffer;
+    std::unique_ptr<ShadowMap> m_shadowMap;   // CSM: Texture2DArray глубины
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowPSO;   // depth-only проход в каскады
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_shadowVS;
 
     D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
 
@@ -175,35 +173,8 @@ private:
     DirectX::XMFLOAT4X4 m_proj{};
     DirectX::XMFLOAT3 m_eyePos{ -30.f, 25.f, -30.f };
 
+    // Направление, КУДА светит солнце (от источника к сцене).
+    DirectX::XMFLOAT3 m_sunDir{ 0.15f, -0.96f, 0.22f };
+
     float m_time = 0.f;
-    // === Scatter scene ===
-    static constexpr uint32_t kScatterGridSide = 32;              // 32x32 = 1024 объекта
-    static constexpr uint32_t kScatterInstanceCount = kScatterGridSide * kScatterGridSide;
-
-    int m_sceneMode = 0;                          // 0 = cliff deferred, 1 = scatter
-    bool m_useFrustumCulling = true;
-    bool m_useOctreeCulling = false;
-
-    struct ScatterInstance
-    {
-        DirectX::XMFLOAT4X4 World;
-        AABB                WorldBounds;
-    };
-    std::vector<ScatterInstance> m_scatterInstances;
-    std::vector<uint32_t>        m_scatterVisible;
-
-    Octree m_scatterOctree;
-    bool   m_scatterOctreeBuilt = false;
-
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_scatterRootSig;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_scatterPSO;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_scatterVS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_scatterPS;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_scatterViewCB;
-    uint8_t* m_mappedScatterViewCB = nullptr;
-
-    AABB m_meshBounds;   // локальный AABB меша гнома (считается по вершинам)
-
-    bool BuildScatterResources();
-    void UpdateScatterVisible();
 };

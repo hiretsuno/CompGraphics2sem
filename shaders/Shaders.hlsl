@@ -42,6 +42,18 @@ GeoVSOut GeometryVS(VSIn vin)
     return vout;
 }
 
+// ---------------- Shadow pass: только глубина в текущий каскад ----------------
+cbuffer CascadeCB : register(b4)
+{
+    float4x4 gCascadeViewProj;   // LightViewProj текущего каскада (root constants)
+};
+
+float4 ShadowVS(VSIn vin) : SV_POSITION
+{
+    float4 posW = mul(float4(vin.PosL, 1.f), gWorld);
+    return mul(posW, gCascadeViewProj);
+}
+
 struct GBufferOut
 {
     float4 AlbedoSpec : SV_Target0;
@@ -69,7 +81,7 @@ struct GpuLight
     float4 PositionRange;   // xyz = position,  w = range
     float4 DirectionSpot;   // xyz = direction, w = cos(outerAngle)
     float4 ColorIntensity;  // rgb = color,     a = intensity
-    float4 Params;          // x = type (0=dir, 1=point, 2=spot), y = cos(innerAngle)
+    float4 Params;          // x = type (0=dir, 1=point, 2=spot), y = cos(innerAngle), z = casts shadow (только dir)
 };
 
 #define MAX_LIGHTS 32
@@ -84,6 +96,60 @@ cbuffer LightCB : register(b1)
 Texture2D gAlbedoSpecTex : register(t1);
 Texture2D gNormalTex : register(t2);
 Texture2D gDepthTex : register(t3);
+
+// ---------------- CSM ----------------
+#define CASCADE_COUNT 4
+#define SHADOW_MAP_SIZE 2048.0
+
+cbuffer ShadowCB : register(b3)
+{
+    float4x4 gLightViewProj[CASCADE_COUNT];  // World -> clip света для каждого каскада
+    float4   gCascadeSplits;                 // дальние границы каскадов (расстояние вдоль взгляда)
+    float4   gTexelWorld;                    // размер текселя каскада в метрах
+};
+
+Texture2DArray<float>  gShadowMap     : register(t4);
+SamplerComparisonState gShadowSampler : register(s1);   // аппаратное сравнение + билинейный PCF
+
+// Возвращает 1 = свет, 0 = тень. viewZ — глубина пикселя вдоль взгляда камеры.
+float ShadowFactor(float3 posW, float3 N, float3 L, float viewZ)
+{
+    // 1. Выбор каскада по глубине
+    int c = 0;
+    if (viewZ > gCascadeSplits.x) c = 1;
+    if (viewZ > gCascadeSplits.y) c = 2;
+    if (viewZ > gCascadeSplits.z) c = 3;
+    if (viewZ > gCascadeSplits.w) return 1.f;   // дальше дальности теней
+
+    // 2. Bias с учётом наклона поверхности (всё в метрах, кратно размеру текселя каскада)
+    float texelWorld = gTexelWorld[c];
+    float NdotL      = saturate(dot(N, L));
+    float tanTheta   = min(sqrt(1.f - NdotL * NdotL) / max(NdotL, 0.05f), 3.f);
+
+    float normalOffset = texelWorld * 1.5f;                     // сдвиг вдоль нормали убирает acne на скосах
+    float slopeBias    = texelWorld * (1.f + 1.5f * tanTheta);  // сдвиг к свету растёт с наклоном
+    float3 biasedPos   = posW + N * normalOffset + L * slopeBias;
+
+    // 3. В пространство света -> UV карты и эталонная глубина
+    float4 lightPos = mul(float4(biasedPos, 1.f), gLightViewProj[c]);
+    float2 uv       = lightPos.xy * float2(0.5f, -0.5f) + 0.5f;
+    float  depth    = lightPos.z;
+
+    // 4. PCF 3x3: 9 выборок, каждая ещё и билинейно фильтруется железом
+    const float texelUV = 1.f / SHADOW_MAP_SIZE;
+    float lit = 0.f;
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            float2 offset = float2(x, y) * texelUV;
+            lit += gShadowMap.SampleCmpLevelZero(gShadowSampler, float3(uv + offset, c), depth);
+        }
+    }
+    return lit / 9.f;
+}
 
 struct QuadVSOut
 {
@@ -101,12 +167,13 @@ QuadVSOut LightingVS(uint id : SV_VertexID)
 }
 
 // Reconstruct world-space position from NDC depth + pixel UV
-float3 ReconstructWorldPos(float2 uv, float ndcDepth)
+float3 ReconstructWorldPos(float2 uv, float ndcDepth, out float viewZ)
 {
     // uv in [0,1], convert to NDC xy
     float4 clipPos = float4(uv * float2(2.f, -2.f) + float2(-1.f, 1.f),
                             ndcDepth, 1.f);
     float4 worldPos = mul(clipPos, gInvViewProj);
+    viewZ = 1.f / worldPos.w;   // worldPos.w = 1 / clip.w, а clip.w = глубина вдоль взгляда
     return worldPos.xyz / worldPos.w;
 }
 
@@ -115,7 +182,8 @@ float4 LightingPS(QuadVSOut pin) : SV_TARGET
     int3 coords = int3((int2)pin.PosH.xy, 0);
 
     float4 albedoSpec = gAlbedoSpecTex.Load(coords);
-    float3 albedo = albedoSpec.rgb;
+    // Текстуры хранятся в sRGB: считаем освещение в линейном пространстве, гамма — на выходе.
+    float3 albedo = pow(albedoSpec.rgb, 2.2f);
     float  specInt = albedoSpec.a;
 
     float4 normalSample = gNormalTex.Load(coords);
@@ -130,7 +198,8 @@ float4 LightingPS(QuadVSOut pin) : SV_TARGET
         return float4(0.f, 0.f, 0.f, 1.f);
 
     float2 uv = pin.PosH.xy * gRTSize.zw;
-    float3 posW = ReconstructWorldPos(uv, ndcDepth);
+    float  viewZ;
+    float3 posW = ReconstructWorldPos(uv, ndcDepth, viewZ);
     float3 V = normalize(gEyePosW.xyz - posW);
 
     // Ambient
@@ -150,6 +219,8 @@ float4 LightingPS(QuadVSOut pin) : SV_TARGET
         {
             // ---- Directional ----
             L = normalize(-light.DirectionSpot.xyz);
+            if (light.Params.z > 0.5f)   // Params.z = 1: источник отбрасывает каскадные тени
+                attenuation = ShadowFactor(posW, N, L, viewZ);
         }
         else if (type < 1.5f)
         {
@@ -190,5 +261,5 @@ float4 LightingPS(QuadVSOut pin) : SV_TARGET
         finalColor += (albedo * NdotL + spec) * lightColor * intensity * attenuation;
     }
 
-    return float4(finalColor, 1.f);
+    return float4(pow(saturate(finalColor), 1.f / 2.2f), 1.f);
 }

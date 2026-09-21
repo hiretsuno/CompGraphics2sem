@@ -21,6 +21,15 @@ public:
     D3D12_GPU_DESCRIPTOR_HANDLE GetSrvTable() const { return m_srvHeap->GetGPUDescriptorHandleForHeapStart(); }
     D3D12_CPU_DESCRIPTOR_HANDLE GetDsv() const { return m_dsvHeap->GetCPUDescriptorHandleForHeapStart(); }
 
+    // Лишний слот в SRV-куче (сразу после G-buffer) — под SRV карты теней.
+    // Так lighting pass читает всё из одной кучи.
+    D3D12_CPU_DESCRIPTOR_HANDLE GetShadowSrvCpu() const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(TargetCount) * m_srvDescriptorSize;
+        return h;
+    }
+
     DXGI_FORMAT GetAlbedoSpecFormat() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
     DXGI_FORMAT GetNormalFormat() const { return DXGI_FORMAT_R16G16B16A16_FLOAT; }
     DXGI_FORMAT GetDepthValueFormat() const { return DXGI_FORMAT_R32_FLOAT; }
@@ -34,6 +43,7 @@ private:
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint32_t m_rtvDescriptorSize = 0;
+    uint32_t m_srvDescriptorSize = 0;
 
     bool m_isWriteState = false;
 

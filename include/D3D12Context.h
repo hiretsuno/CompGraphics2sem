@@ -19,16 +19,6 @@ public:
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
 
-    // === Лаба 4: переключение режимов ===
-    void ToggleSceneMode();
-    void ToggleFrustumCulling();
-    void ToggleOctreeCulling();
-    bool FrustumCullingOn() const;
-    bool OctreeCullingOn() const;
-    bool ScatterModeOn() const;
-    uint32_t ScatterVisibleCount() const;
-    uint32_t ScatterTotalCount() const;
-
 private:
     std::unique_ptr<RenderingSystem> m_renderer;
 };

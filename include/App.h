@@ -25,9 +25,9 @@ private:
     uint64_t m_prevTick = 0;
     double m_secondsPerTick = 0.0;
 
-    float m_camYaw = 0.785f;   // 45° — смотрим в центр сетки
-    float m_camPitch = -0.3f;  // смотрим чуть вниз
-    DirectX::XMFLOAT3 m_camPos{ -50.f, 30.f, -50.f };
+    float m_camYaw = 1.5708f;  // стартовый вид: вдоль длинной оси атриума (+X)
+    float m_camPitch = 0.f;
+    DirectX::XMFLOAT3 m_camPos{ -6.f, 3.f, 0.f };
 
     POINT m_savedCursorPos{ 0, 0 };
     bool m_justEnteredRmbLook = false;
