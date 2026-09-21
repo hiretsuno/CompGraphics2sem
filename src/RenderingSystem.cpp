@@ -763,11 +763,13 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
 
     BuildShaders();
     BuildRootSignature();
+    BuildPostRootSignature();
     BuildGeometry();
     BuildFrameResources();
 
     m_gBuffer = std::make_unique<GBuffer>();
     m_gBuffer->Initialize(m_device.Get(), m_width, m_height);
+    CreateSceneColor();   // после GBuffer: SRV пишется в его кучу
 
     m_shadowMap = std::make_unique<ShadowMap>();
     m_shadowMap->Initialize(m_device.Get(), m_gBuffer->GetShadowSrvCpu());
@@ -799,6 +801,12 @@ void RenderingSystem::Shutdown()
     {
         m_lightConstantBuffer->Unmap(0, nullptr);
         m_mappedLightConstants = nullptr;
+    }
+
+    if (m_postConstantBuffer && m_mappedPostConstants)
+    {
+        m_postConstantBuffer->Unmap(0, nullptr);
+        m_mappedPostConstants = nullptr;
     }
 
     if (m_particles)
@@ -847,7 +855,10 @@ void RenderingSystem::OnResize(uint32_t width, uint32_t height)
     CreateBackBufferRTVs();
 
     if (m_gBuffer)
+    {
         m_gBuffer->Resize(m_device.Get(), m_width, m_height);
+        CreateSceneColor();
+    }
 
     m_viewport = { 0.f, 0.f, static_cast<float>(m_width), static_cast<float>(m_height), 0.f, 1.f };
     m_scissorRect = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
@@ -936,21 +947,21 @@ void RenderingSystem::Draw(float dt)
             drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
     }
 
-    //Lighting pass: читаем G-buffer, пишем в back buffer
+    //Lighting pass: читаем G-buffer, пишем в SceneColor (не в back buffer: результат нужен постпроцессу как текстура)
     m_gBuffer->TransitionToRead(m_commandList.Get());
 
-    D3D12_RESOURCE_BARRIER toRenderTarget{};
-    toRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    toRenderTarget.Transition.pResource   = CurrentBackBuffer();
-    toRenderTarget.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    toRenderTarget.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    toRenderTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    m_commandList->ResourceBarrier(1, &toRenderTarget);
+    D3D12_RESOURCE_BARRIER sceneToRt{};
+    sceneToRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    sceneToRt.Transition.pResource   = m_sceneColor.Get();
+    sceneToRt.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    sceneToRt.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    sceneToRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(1, &sceneToRt);
 
-    const auto backBufferRtv = CurrentBackBufferRTV();
+    const D3D12_CPU_DESCRIPTOR_HANDLE sceneRtv = m_sceneRtvHeap->GetCPUDescriptorHandleForHeapStart();
     const float clearColor[4] = { 0.f, 0.f, 0.f, 1.f };
-    m_commandList->OMSetRenderTargets(1, &backBufferRtv, TRUE, nullptr);
-    m_commandList->ClearRenderTargetView(backBufferRtv, clearColor, 0, nullptr);
+    m_commandList->OMSetRenderTargets(1, &sceneRtv, TRUE, nullptr);
+    m_commandList->ClearRenderTargetView(sceneRtv, clearColor, 0, nullptr);
 
     m_commandList->SetPipelineState(m_lightingPSO.Get());
     m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
@@ -968,7 +979,7 @@ void RenderingSystem::Draw(float dt)
 
     //Particle render pass: точки -> GS-билборды, depth-тест по глубине сцены
     const D3D12_CPU_DESCRIPTOR_HANDLE sceneDsv = m_gBuffer->GetDsv();
-    m_commandList->OMSetRenderTargets(1, &backBufferRtv, FALSE, &sceneDsv);
+    m_commandList->OMSetRenderTargets(1, &sceneRtv, FALSE, &sceneDsv);
     m_commandList->SetPipelineState(m_particlePSO.Get());
     m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
@@ -977,8 +988,32 @@ void RenderingSystem::Draw(float dt)
     // Сколько точек рисовать — знает только GPU (счётчик в буфере аргументов), поэтому ExecuteIndirect.
     m_commandList->ExecuteIndirect(m_particles->GetDrawSignature(), 1, m_particles->GetIndirectArgs(), 0, nullptr, 0);
 
+    // Post-process pass: SceneColor RT -> SRV, back buffer PRESENT -> RT (одним вызовом)
+    D3D12_RESOURCE_BARRIER postBarriers[2] = {};
+    postBarriers[0] = sceneToRt;
+    postBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    postBarriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    postBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    postBarriers[1].Transition.pResource   = CurrentBackBuffer();
+    postBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    postBarriers[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    postBarriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(2, postBarriers);
+
+    const auto backBufferRtv = CurrentBackBufferRTV();
+    m_commandList->OMSetRenderTargets(1, &backBufferRtv, TRUE, nullptr);   // без clear: треугольник перезаписывает все пиксели
+
+    m_commandList->SetGraphicsRootSignature(m_postRootSignature.Get());   // смена RS сбрасывает прежние биндинги
+    m_commandList->SetPipelineState(m_postPSO.Get());
+    ID3D12DescriptorHeap* postHeaps[] = { m_gBuffer->GetSrvHeap() };
+    m_commandList->SetDescriptorHeaps(1, postHeaps);
+    m_commandList->SetGraphicsRootConstantBufferView(0, m_postConstantBuffer->GetGPUVirtualAddress());
+    m_commandList->SetGraphicsRootDescriptorTable(1, m_gBuffer->GetSrvTable());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+
     // Back buffer: RENDER_TARGET → PRESENT
-    D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
+    D3D12_RESOURCE_BARRIER toPresent = postBarriers[1];
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     toPresent.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     m_commandList->ResourceBarrier(1, &toPresent);
@@ -1007,6 +1042,11 @@ void RenderingSystem::SetCamera(const XMFLOAT3& eyePos, float yaw, float pitch)
     XMStoreFloat4x4(
         &m_view,
         XMMatrixLookToLH(XMVectorSet(eyePos.x, eyePos.y, eyePos.z, 1.f), forward, XMVectorSet(0.f, 1.f, 0.f, 0.f)));
+}
+
+void RenderingSystem::SetPostEffects(bool vignette, bool chroma, int debugView)
+{
+    m_post.Flags = XMFLOAT4(vignette ? 1.f : 0.f, chroma ? 1.f : 0.f, 0.f, static_cast<float>(debugView));
 }
 
 bool RenderingSystem::CreateDevice()
@@ -1131,6 +1171,23 @@ bool RenderingSystem::BuildShaders()
     compileParticle("ParticleVS", "vs_5_0", m_particleVS);
     compileParticle("ParticleGS", "gs_5_0", m_particleGS);
     compileParticle("ParticlePS", "ps_5_0", m_particlePS);
+
+    // Post-process: VS и PS в разных файлах.
+    auto compileFile = [&](const char* relPath, const char* entryPoint, const char* target, ComPtr<ID3DBlob>& bytecode)
+    {
+        errors.Reset();
+        const std::wstring path = ToWide(ResolveAssetPath(relPath));
+        const HRESULT hr = D3DCompileFromFile(path.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            entryPoint, target, compileFlags, 0, &bytecode, &errors);
+        if (FAILED(hr))
+        {
+            if (errors)
+                throw std::runtime_error(static_cast<const char*>(errors->GetBufferPointer()));
+            ThrowIfFailed(hr, entryPoint);
+        }
+    };
+    compileFile("shaders/FullscreenQuadVS.hlsl", "FullscreenVS", "vs_5_0", m_postVS);
+    compileFile("shaders/PostProcessPS.hlsl", "PostProcessPS", "ps_5_0", m_postPS);
 
     m_inputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[1] = { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
@@ -1374,7 +1431,116 @@ bool RenderingSystem::BuildPSOs()
     particlePso.SampleDesc.Count = 1;
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&particlePso, IID_PPV_ARGS(&m_particlePSO)), "Create particle PSO");
 
+    // Post-process PSO: полноэкранный треугольник без vertex buffer, без depth, вывод в back buffer.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC postPso{};
+    postPso.pRootSignature = m_postRootSignature.Get();
+    postPso.VS = { m_postVS->GetBufferPointer(), m_postVS->GetBufferSize() };
+    postPso.PS = { m_postPS->GetBufferPointer(), m_postPS->GetBufferSize() };
+    postPso.BlendState = blend;
+    postPso.SampleMask = UINT_MAX;
+    postPso.RasterizerState = rasterizer;                 // CULL_NONE: порядок обхода вершин неважен
+    postPso.DepthStencilState = lightingDepth;            // DepthEnable = FALSE
+    postPso.InputLayout = { nullptr, 0 };
+    postPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;   // в списке команд: TRIANGLELIST
+    postPso.NumRenderTargets = 1;
+    postPso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;   // формат back buffer
+    postPso.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    postPso.SampleDesc.Count = 1;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&postPso, IID_PPV_ARGS(&m_postPSO)), "Create post-process PSO");
+
     return true;
+}
+
+bool RenderingSystem::BuildPostRootSignature()
+{
+    // Таблица указывает в кучу GBuffer: слоты 0..2 = G-Buffer (t0..t2), слот 3 = shadow map (пропускаем), слот 4 = SceneColor (t3).
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = GBuffer::TargetCount;
+    ranges[0].BaseShaderRegister = 0;
+    ranges[0].OffsetInDescriptorsFromTableStart = 0;
+
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].BaseShaderRegister = GBuffer::TargetCount;   // t3
+    ranges[1].OffsetInDescriptorsFromTableStart = GBuffer::TargetCount + 1;   // перепрыгиваем слот shadow map
+
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   // b0 = PostCB
+    params[0].Descriptor.ShaderRegister = 0;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 2;
+    params[1].DescriptorTable.pDescriptorRanges = ranges;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler{};   // s0: linear clamp (для сдвинутых выборок хроматической аберрации у краёв)
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters = _countof(params);
+    desc.pParameters = params;
+    desc.NumStaticSamplers = 1;
+    desc.pStaticSamplers = &sampler;
+    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;   // без ALLOW_INPUT_ASSEMBLER: vertex buffer не используется
+
+    ComPtr<ID3DBlob> serialized;
+    ComPtr<ID3DBlob> errors;
+    const HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors);
+    if (FAILED(hr))
+    {
+        if (errors)
+            throw std::runtime_error(static_cast<const char*>(errors->GetBufferPointer()));
+        ThrowIfFailed(hr, "SerializeRootSignature (post)");
+    }
+    ThrowIfFailed(
+        m_device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&m_postRootSignature)),
+        "CreateRootSignature (post)");
+    return true;
+}
+
+void RenderingSystem::CreateSceneColor()
+{
+    // Вызывается и при Resize: старый ресурс уже никем не используется (OnResize делает FlushCommandQueue).
+    m_sceneColor.Reset();
+
+    if (!m_sceneRtvHeap)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+        heapDesc.NumDescriptors = 1;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        ThrowIfFailed(m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_sceneRtvHeap)), "Create SceneColor RTV heap");
+    }
+
+    D3D12_RESOURCE_DESC desc = TextureDesc2D(m_width, m_height, DXGI_FORMAT_R8G8B8A8_UNORM);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = desc.Format;   // цвет очистки = (0,0,0,0)
+
+    const auto defaultHeap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    ThrowIfFailed(
+        m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&m_sceneColor)),   // как у G-Buffer: старт в SRV-состоянии
+        "Create SceneColor");
+
+    m_device->CreateRenderTargetView(m_sceneColor.Get(), nullptr, m_sceneRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = desc.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(m_sceneColor.Get(), &srv, m_gBuffer->GetSceneColorSrvCpu());
 }
 
 bool RenderingSystem::BuildGeometry()
@@ -1566,7 +1732,13 @@ bool RenderingSystem::BuildFrameResources()
         m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &lightDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_lightConstantBuffer)),
         "Create light constant buffer");
 
+    const D3D12_RESOURCE_DESC postDesc = BufferDesc(AlignConstantBufferSize(sizeof(PostConstants)));
+    ThrowIfFailed(
+        m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &postDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_postConstantBuffer)),
+        "Create post constant buffer");
+
     D3D12_RANGE readRange{ 0, 0 };
+    ThrowIfFailed(m_postConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_mappedPostConstants)), "Map post constant buffer");
     ThrowIfFailed(m_passConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_mappedPassConstants)), "Map pass constant buffer");
     ThrowIfFailed(m_lightConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_mappedLightConstants)), "Map light constant buffer");
     return true;
@@ -1597,6 +1769,13 @@ void RenderingSystem::UpdatePassConstants()
         1.f / static_cast<float>(m_height));
 
     std::memcpy(m_mappedPassConstants, &constants, sizeof(constants));
+
+    // Post-process CB: размер RT берём из PassConstants, параметры эффектов лежат в m_post.
+    if (m_mappedPostConstants)
+    {
+        m_post.RenderTargetSize = constants.RenderTargetSize;
+        std::memcpy(m_mappedPostConstants, &m_post, sizeof(m_post));
+    }
 }
 
 void RenderingSystem::UpdateLightConstants(float dt)

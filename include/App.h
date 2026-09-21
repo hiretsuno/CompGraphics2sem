@@ -29,6 +29,12 @@ private:
     float m_camPitch = -0.2f;
     DirectX::XMFLOAT3 m_camPos{ -4.f, 2.f, 0.f };   // эмиттер частиц в (2, 0, 0) — прямо перед камерой
 
+    // Post-process: F1 = vignette, F2 = chromatic aberration, F3 = debug G-Buffer (albedo -> normal -> depth -> off)
+    bool m_vignetteOn = true;
+    bool m_chromaOn = true;
+    int  m_debugView = 0;
+    bool m_prevF[3]{};
+
     POINT m_savedCursorPos{ 0, 0 };
     bool m_justEnteredRmbLook = false;
 };

@@ -69,6 +69,14 @@ void App::Update(float dt)
 
     if (!m_input || !m_dx12 || !m_window) return;
 
+    // Переключение эффектов по фронту нажатия (IsKeyDown — уровень, а не событие).
+    const bool f[3] = { m_input->IsKeyDown(VK_F1), m_input->IsKeyDown(VK_F2), m_input->IsKeyDown(VK_F3) };
+    if (f[0] && !m_prevF[0]) m_vignetteOn = !m_vignetteOn;
+    if (f[1] && !m_prevF[1]) m_chromaOn = !m_chromaOn;
+    if (f[2] && !m_prevF[2]) m_debugView = (m_debugView + 1) % 4;
+    for (int i = 0; i < 3; ++i) m_prevF[i] = f[i];
+    m_dx12->SetPostEffects(m_vignetteOn, m_chromaOn, m_debugView);
+
     if (m_input->IsKeyDown(VK_RBUTTON))
     {
         HWND hwnd = m_window->GetHwnd();

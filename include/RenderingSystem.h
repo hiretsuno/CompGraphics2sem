@@ -37,6 +37,7 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
+    void SetPostEffects(bool vignette, bool chroma, int debugView);   // debugView: 0=off, 1=albedo, 2=normal, 3=depth
 
 private:
     struct MaterialConstants
@@ -70,6 +71,15 @@ private:
         DirectX::XMFLOAT4 Params{}; // x = type, y = cos(innerAngle)
     };
 
+    // Должна совпадать с cbuffer PostCB в PostProcessPS.hlsl.
+    struct alignas(16) PostConstants
+    {
+        DirectX::XMFLOAT4 RenderTargetSize{ 1.f, 1.f, 1.f, 1.f };
+        DirectX::XMFLOAT4 Vignette{ 0.75f, 0.35f, 0.f, 0.f }; // x = intensity, y = radius (где начинается затемнение)
+        DirectX::XMFLOAT4 Chroma{ 0.006f, 0.f, 0.f, 0.f };    // x = strength (UV)
+        DirectX::XMFLOAT4 Flags{ 1.f, 1.f, 0.f, 0.f };        // vignette, chroma, unused, debug view (0..3)
+    };
+
     static constexpr uint32_t MaxLights = 32;
 
     struct alignas(16) LightConstants
@@ -89,6 +99,8 @@ private:
     bool BuildShaders();
     bool BuildRootSignature();
     bool BuildPSOs();
+    bool BuildPostRootSignature();
+    void CreateSceneColor();   // RT для lighting/particles + его SRV в куче GBuffer
     bool BuildGeometry();
     bool BuildFrameResources();
 
@@ -147,6 +159,17 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowPSO;   // depth-only проход в каскады
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_particlePSO; // частицы: VS + GS + PS, POINTLIST
+
+    // Post-process: полноэкранный треугольник, читает SceneColor + G-Buffer, пишет в back buffer.
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_postRootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_postPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_postVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_postPS;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_sceneColor;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_sceneRtvHeap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_postConstantBuffer;
+    uint8_t* m_mappedPostConstants = nullptr;
+    PostConstants m_post;   // CPU-копия параметров эффектов
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
