@@ -36,3 +36,9 @@ void D3D12Context::SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float p
     if (m_renderer)
         m_renderer->SetCamera(eyePos, yaw, pitch);
 }
+
+void D3D12Context::RotateSun(float deltaAzimuth, float deltaHeight)
+{
+    if (m_renderer)
+        m_renderer->RotateSun(deltaAzimuth, deltaHeight);
+}

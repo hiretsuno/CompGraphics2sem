@@ -37,6 +37,10 @@ public:
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
 
+    // Поворот солнца (радианы): deltaAzimuth - вокруг вертикальной оси,
+    // deltaHeight > 0 поднимает солнце над горизонтом, < 0 опускает.
+    void RotateSun(float deltaAzimuth, float deltaHeight);
+
 private:
     struct MaterialConstants
     {

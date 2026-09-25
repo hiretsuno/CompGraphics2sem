@@ -69,6 +69,18 @@ void App::Update(float dt)
 
     if (!m_input || !m_dx12 || !m_window) return;
 
+    // Стрелки крутят солнце: Left/Right - вокруг сцены, Up/Down - выше/ниже над горизонтом.
+    // Умножаем на dt, чтобы скорость поворота не зависела от FPS.
+    const float sunTurnSpeed = 1.0f;   // радиан в секунду
+    float sunAzimuth = 0.f;
+    float sunHeight = 0.f;
+    if (m_input->IsKeyDown(VK_LEFT))  sunAzimuth -= sunTurnSpeed * dt;
+    if (m_input->IsKeyDown(VK_RIGHT)) sunAzimuth += sunTurnSpeed * dt;
+    if (m_input->IsKeyDown(VK_UP))    sunHeight  += sunTurnSpeed * dt;
+    if (m_input->IsKeyDown(VK_DOWN))  sunHeight  -= sunTurnSpeed * dt;
+    if (sunAzimuth != 0.f || sunHeight != 0.f)
+        m_dx12->RotateSun(sunAzimuth, sunHeight);
+
     if (m_input->IsKeyDown(VK_RBUTTON))
     {
         HWND hwnd = m_window->GetHwnd();

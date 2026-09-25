@@ -1549,6 +1549,29 @@ void RenderingSystem::UpdateLightConstants(float dt)
     std::memcpy(m_mappedLightConstants, &constants, sizeof(constants));
 }
 
+void RenderingSystem::RotateSun(float deltaAzimuth, float deltaHeight)
+{
+    // m_sunDir - направление, КУДА светит солнце. Раскладываем его на азимут (поворот вокруг оси Y)
+    // и высоту над горизонтом (> 0: солнце над горизонтом, свет идёт вниз).
+    float azimuth = std::atan2(m_sunDir.x, m_sunDir.z);
+    float height = std::asin(std::clamp(-m_sunDir.y, -1.f, 1.f));
+
+    azimuth += deltaAzimuth;
+    // Не пускаем солнце под горизонт и строго в зенит: там вырождается матрица света
+    // (в UpdateCascades вектор "вверх" = (0,1,0) станет параллелен направлению света).
+    height = std::clamp(height + deltaHeight, 0.15f, XM_PIDIV2 - 0.05f);
+
+    m_sunDir = XMFLOAT3(
+        std::cos(height) * std::sin(azimuth),
+        -std::sin(height),
+        std::cos(height) * std::cos(azimuth));
+
+    // Освещение: источник [0] - это солнце (см. CreateSceneLights). Заполняющий свет [1] не трогаем.
+    // Тени: m_sunDir каждый кадр уходит в UpdateCascades (см. Draw), матрицы каскадов пересчитаются сами.
+    if (!m_sceneLights.empty())
+        m_sceneLights[0].DirectionSpot = XMFLOAT4(m_sunDir.x, m_sunDir.y, m_sunDir.z, 0.f);
+}
+
 void RenderingSystem::CreateSceneLights()
 {
     auto normalize = [](const XMFLOAT3& v) -> XMFLOAT3
@@ -1623,4 +1646,4 @@ D3D12_CPU_DESCRIPTOR_HANDLE RenderingSystem::CurrentBackBufferRTV() const
 ID3D12Resource* RenderingSystem::CurrentBackBuffer() const
 {
     return m_backBuffers[m_backBufferIndex].Get();
-}
+}

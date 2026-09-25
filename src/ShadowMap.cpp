@@ -28,7 +28,7 @@ void ShadowMap::Initialize(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE srv
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = Size;
     desc.Height = Size;
-    desc.DepthOrArraySize = CascadeCount;   // слайсы массива = каскады
+    desc.DepthOrArraySize = CascadeCount;   //каскады ы
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_R32_TYPELESS;
     desc.SampleDesc.Count = 1;
