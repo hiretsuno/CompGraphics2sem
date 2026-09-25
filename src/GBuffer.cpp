@@ -60,7 +60,7 @@ bool GBuffer::Initialize(ID3D12Device* device, uint32_t width, uint32_t height)
     ThrowIfFailed(device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_rtvHeap)), "Create GBuffer RTV heap");
 
     D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
-    srvHeapDesc.NumDescriptors = TargetCount + 2;   // +1 слот под shadow map SRV, +1 под SceneColor SRV
+    srvHeapDesc.NumDescriptors = TargetCount + 2 + IblCount;   // +1 shadow map SRV, +1 SceneColor SRV, +3 IBL
     srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&m_srvHeap)), "Create GBuffer SRV heap");
@@ -148,12 +148,14 @@ void GBuffer::BindForGeometryPass(ID3D12GraphicsCommandList* cmdList)
     const float clearAlbedo[4] = { 0.f, 0.f, 0.f, 0.f };
     const float clearNormal[4] = { 0.f, 0.f, 1.f, 0.f };
     const float clearDepthValue[4] = { 1.f, 1.f, 1.f, 1.f };
+    const float clearMaterial[4] = { 0.f, 1.f, 1.f, 0.f };   // metallic 0, roughness 1, ao 1
 
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = GetDsv();
     cmdList->OMSetRenderTargets(TargetCount, rtvs, FALSE, &dsv);
     cmdList->ClearRenderTargetView(rtvs[0], clearAlbedo, 0, nullptr);
     cmdList->ClearRenderTargetView(rtvs[1], clearNormal, 0, nullptr);
     cmdList->ClearRenderTargetView(rtvs[2], clearDepthValue, 0, nullptr);
+    cmdList->ClearRenderTargetView(rtvs[3], clearMaterial, 0, nullptr);
     cmdList->ClearDepthStencilView(GetDsv(), D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
 }
 
@@ -164,7 +166,8 @@ void GBuffer::CreateResources(ID3D12Device* device)
     const DXGI_FORMAT formats[TargetCount] = {
         GetAlbedoSpecFormat(),
         GetNormalFormat(),
-        GetDepthValueFormat()
+        GetDepthValueFormat(),
+        GetMaterialFormat()
     };
 
     D3D12_CLEAR_VALUE clears[TargetCount]{};
@@ -185,6 +188,12 @@ void GBuffer::CreateResources(ID3D12Device* device)
     clears[2].Color[1] = 1.f;
     clears[2].Color[2] = 1.f;
     clears[2].Color[3] = 1.f;
+
+    clears[3].Format = formats[3];
+    clears[3].Color[0] = 0.f;
+    clears[3].Color[1] = 1.f;
+    clears[3].Color[2] = 1.f;
+    clears[3].Color[3] = 0.f;
 
     for (uint32_t i = 0; i < TargetCount; ++i)
     {

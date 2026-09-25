@@ -9,12 +9,17 @@ cbuffer PassCB : register(b0)
 
 cbuffer MaterialCB : register(b2)
 {
-    float4 gBaseColor;      // rgb = diffuse tint,  a unused
-    float4 gSurfaceParams;  // x = specular intensity, y = shininess
+    float4 gBaseColor;      // rgb = albedo tint,  a unused
+    float4 gSurfaceParams;  // x = metallic factor, y = roughness factor, z = ao (множители на gMetalRoughMap.b/.g)
 };
 
-Texture2D    gDiffuseMap : register(t0);
+Texture2D    gDiffuseMap    : register(t0);    // albedo (sRGB-данные, декодируются в lighting pass)
+Texture2D    gNormalMap     : register(t9);    // тангенциальная normal map; 1x1 заглушка = (0.5, 0.5, 1)
+Texture2D    gMetalRoughMap : register(t10);   // map_MR: r = metallic, g = roughness (проверено по пикселям Cerberus_MR.jpg — не совпадает с glTF g/b!); 1x1 заглушка = (1, 1, _)
 SamplerState gSampler : register(s0);
+
+// Если у normal map зелёный канал "вверх" по OpenGL, а не по DirectX — поставить 1.
+#define NORMAL_MAP_FLIP_Y 0
 
 struct VSIn
 {
@@ -59,19 +64,48 @@ struct GBufferOut
     float4 AlbedoSpec : SV_Target0;
     float4 Normal : SV_Target1;
     float  Depth : SV_Target2;
+    float4 Material : SV_Target3;   // r = metallic, g = roughness, b = ao
 };
+
+// Базис TBN из производных позиции и UV (без тангентов в вершинах). Строки матрицы: T, B, N.
+float3x3 CotangentFrame(float3 N, float3 posW, float2 uv)
+{
+    float3 dp1 = ddx(posW);
+    float3 dp2 = ddy(posW);
+    float2 duv1 = ddx(uv);
+    float2 duv2 = ddy(uv);
+
+    float3 dp2perp = cross(dp2, N);
+    float3 dp1perp = cross(N, dp1);
+    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+
+    float invMax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-20f));
+    return float3x3(T * invMax, B * invMax, N);
+}
 
 GBufferOut GeometryPS(GeoVSOut pin)
 {
     GBufferOut gout;
 
     float3 albedo = gDiffuseMap.Sample(gSampler, pin.TexC).rgb * gBaseColor.rgb;
-    float  specInt = gSurfaceParams.x;
-    float  shiny = gSurfaceParams.y;
 
-    gout.AlbedoSpec = float4(albedo, specInt);
-    gout.Normal = float4(normalize(pin.NormalW), shiny);
+    // Normal mapping: тангенциальная нормаль -> мир
+    float3 N = normalize(pin.NormalW);
+    float3 tn = gNormalMap.Sample(gSampler, pin.TexC).xyz * 2.f - 1.f;
+#if NORMAL_MAP_FLIP_Y
+    tn.y = -tn.y;
+#endif
+    N = normalize(mul(normalize(tn), CotangentFrame(N, pin.PosW, pin.TexC)));
+
+    float3 mr = gMetalRoughMap.Sample(gSampler, pin.TexC).rgb;   // заглушка (1,1,_) делает factor'ы обычными константами
+    float  metallic  = saturate(gSurfaceParams.x * mr.r);
+    float  roughness = saturate(gSurfaceParams.y * mr.g);
+
+    gout.AlbedoSpec = float4(albedo, 1.f);
+    gout.Normal = float4(N, 0.f);
     gout.Depth = pin.PosH.z;
+    gout.Material = float4(metallic, roughness, gSurfaceParams.z, 1.f);
     return gout;
 }
 
@@ -88,14 +122,15 @@ struct GpuLight
 
 cbuffer LightCB : register(b1)
 {
-    float4   gAmbientColor;         // rgb = ambient, a unused
+    float4   gPbrDebug;             // x = подмена материала (0..3), y = IBL-ambient вкл, z = прямой свет вкл
     float4   gLightCount;           // x = number of active lights
     GpuLight gLights[MAX_LIGHTS];
 };
 
-Texture2D gAlbedoSpecTex : register(t1);
-Texture2D gNormalTex : register(t2);
-Texture2D gDepthTex : register(t3);
+Texture2D gAlbedoSpecTex : register(t1);   // rgb = albedo (sRGB)
+Texture2D gNormalTex : register(t2);       // xyz = world normal
+Texture2D gDepthTex : register(t3);        // R32_FLOAT, NDC depth
+Texture2D gMaterialTex : register(t4);     // r = metallic, g = roughness, b = ao
 
 // ---------------- CSM ----------------
 #define CASCADE_COUNT 4
@@ -108,8 +143,18 @@ cbuffer ShadowCB : register(b3)
     float4   gTexelWorld;                    // размер текселя каскада в метрах
 };
 
-Texture2DArray<float>  gShadowMap     : register(t4);
+Texture2DArray<float>  gShadowMap     : register(t5);
 SamplerComparisonState gShadowSampler : register(s1);   // аппаратное сравнение + билинейный PCF
+
+// ---------------- IBL (split-sum) ----------------
+// Слоты 6..8 SRV-кучи GBuffer, см. iblRange в BuildRootSignature.
+TextureCube irradianceMap : register(t6);   // диффузная часть, сэмплируется по N
+TextureCube prefilterMap  : register(t7);   // зеркальная часть, mip = roughness * MAX_REFLECTION_LOD
+Texture2D   brdfLUT       : register(t8);   // (NdotV, roughness) -> (scale, bias) для F0
+
+SamplerState irradianceMapSampler : register(s2);   // trilinear clamp, общий для обоих кубмапов
+SamplerState brdfLUTSampler       : register(s3);   // bilinear clamp
+#define prefilterMapSampler irradianceMapSampler    // те же настройки -> один статический сэмплер
 
 // Возвращает 1 = свет, 0 = тень. viewZ — глубина пикселя вдоль взгляда камеры.
 float ShadowFactor(float3 posW, float3 N, float3 L, float viewZ)
@@ -177,6 +222,48 @@ float3 ReconstructWorldPos(float2 uv, float ndcDepth, out float viewZ)
     return worldPos.xyz / worldPos.w;
 }
 
+// ---------------- PBR: Cook-Torrance BRDF ----------------
+static const float PI = 3.14159265359f;
+
+// D: Trowbridge-Reitz GGX. a = roughness^2
+float DistributionGGX(float3 N, float3 H, float roughness)
+{
+    float a      = roughness * roughness;
+    float a2     = a * a;
+    float NdotH  = max(dot(N, H), 0.f);
+    float NdotH2 = NdotH * NdotH;
+
+    float denom = NdotH2 * (a2 - 1.f) + 1.f;
+    return a2 / (PI * denom * denom);
+}
+
+// G_sub: Schlick-GGX
+float GeometrySchlickGGX(float NdotV, float k)
+{
+    return NdotV / (NdotV * (1.f - k) + k);
+}
+
+// G: метод Смита, k для аналитических источников света = (roughness + 1)^2 / 8
+float GeometrySmith(float3 N, float3 V, float3 L, float roughness)
+{
+    float k = (roughness + 1.f) * (roughness + 1.f) / 8.f;
+    float NdotV = max(dot(N, V), 0.f);
+    float NdotL = max(dot(N, L), 0.f);
+    return GeometrySchlickGGX(NdotV, k) * GeometrySchlickGGX(NdotL, k);
+}
+
+// F: Fresnel-Schlick
+float3 fresnelSchlick(float cosTheta, float3 F0)
+{
+    return F0 + (1.f - F0) * pow(clamp(1.f - cosTheta, 0.f, 1.f), 5.f);
+}
+
+// F для ambient: с учётом roughness (иначе шероховатые поверхности дают слишком яркий ободок)
+float3 fresnelSchlickRoughness(float cosTheta, float3 F0, float roughness)
+{
+    return F0 + (max(float3(1.f - roughness, 1.f - roughness, 1.f - roughness), F0) - F0) * pow(clamp(1.f - cosTheta, 0.f, 1.f), 5.f);
+}
+
 float4 LightingPS(QuadVSOut pin) : SV_TARGET
 {
     int3 coords = int3((int2)pin.PosH.xy, 0);
@@ -184,12 +271,19 @@ float4 LightingPS(QuadVSOut pin) : SV_TARGET
     float4 albedoSpec = gAlbedoSpecTex.Load(coords);
     // Текстуры хранятся в sRGB: считаем освещение в линейном пространстве, гамма — на выходе.
     float3 albedo = pow(albedoSpec.rgb, 2.2f);
-    float  specInt = albedoSpec.a;
 
-    float4 normalSample = gNormalTex.Load(coords);
-    float3 N = normalize(normalSample.xyz);
-    float  shininess = normalSample.a;
-    shininess = max(shininess, 1.f);  // avoid pow(x,0)
+    float3 N = normalize(gNormalTex.Load(coords).xyz);
+
+    float3 material  = gMaterialTex.Load(coords).rgb;
+    float  metallic  = material.r;
+    float  roughness = material.g;
+    float  ao        = material.b;
+
+    // Отладочная подмена материала (F4): чтобы увидеть металл / глянец на сцене без металлических текстур
+    if (gPbrDebug.x > 2.5f)      { metallic = 0.f; roughness = 0.1f; }   // 3: глянцевый диэлектрик
+    else if (gPbrDebug.x > 1.5f) { metallic = 0.f; roughness = 1.f; }    // 2: шероховатый диэлектрик
+    else if (gPbrDebug.x > 0.5f) { metallic = 1.f; roughness = 0.15f; }  // 1: хром
+    roughness = clamp(roughness, 0.05f, 1.f);   // при 0 D и G вырождаются
 
     float  ndcDepth = gDepthTex.Load(coords).r;
 
@@ -202,8 +296,10 @@ float4 LightingPS(QuadVSOut pin) : SV_TARGET
     float3 posW = ReconstructWorldPos(uv, ndcDepth, viewZ);
     float3 V = normalize(gEyePosW.xyz - posW);
 
-    // Ambient
-    float3 finalColor = gAmbientColor.rgb * albedo;
+    // Металлический workflow: диэлектрик F0 = 0.04, металл — F0 = albedo
+    float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+
+    float3 Lo = float3(0.f, 0.f, 0.f);   // прямой свет
 
     int lightCount = (int)gLightCount.x;
     for (int i = 0; i < lightCount; ++i)
@@ -253,13 +349,50 @@ float4 LightingPS(QuadVSOut pin) : SV_TARGET
             attenuation = saturate(1.f - t * t) * spotFactor;
         }
 
-        float  NdotL = max(dot(N, L), 0.f);
-        float3 H = normalize(L + V);
-        float  NdotH = max(dot(N, H), 0.f);
-        float  spec = specInt * pow(NdotH, shininess);
+        float3 radiance = lightColor * intensity * attenuation;
 
-        finalColor += (albedo * NdotL + spec) * lightColor * intensity * attenuation;
+        // Cook-Torrance: fr = kd * albedo / PI + ks * (D * F * G) / (4 * (wo.n) * (wi.n))
+        float3 H = normalize(V + L);
+        float  NdotL = max(dot(N, L), 0.f);
+        float  NdotV = max(dot(N, V), 0.f);
+
+        float  D = DistributionGGX(N, H, roughness);
+        float  G = GeometrySmith(N, V, L, roughness);
+        float3 F = fresnelSchlick(max(dot(H, V), 0.f), F0);
+
+        float3 specular = (D * G * F) / (4.f * NdotV * NdotL + 0.0001f);   // ks уже внутри F
+
+        float3 kS = F;
+        float3 kD = (1.f - kS) * (1.f - metallic);   // металл не имеет диффузной части
+
+        Lo += (kD * albedo / PI + specular) * radiance * NdotL;
     }
 
+    // ---------------- Ambient: IBL (split-sum, слайд 79) ----------------
+    float3 normal  = N;
+    float3 viewDir = V;
+    float3 R = reflect(-viewDir, normal);
+
+    float3 F  = fresnelSchlickRoughness(max(dot(normal, viewDir), 0.f), F0, roughness);
+    float3 kS = F;
+    float3 kD = (1.f - kS) * (1.f - metallic);
+
+    float3 irradiance = irradianceMap.Sample(irradianceMapSampler, normal).rgb;
+    float3 diffuse    = irradiance * albedo;
+
+    uint envW, envH, envLevels;
+    prefilterMap.GetDimensions(0, envW, envH, envLevels);
+    float MAX_REFLECTION_LOD = (float)(envLevels - 1);
+
+    float3 prefilteredColor = prefilterMap.SampleLevel(prefilterMapSampler, R, roughness * MAX_REFLECTION_LOD).rgb;
+    float2 brdf     = brdfLUT.Sample(brdfLUTSampler, float2(max(dot(normal, viewDir), 0.f), roughness)).rg;
+    float3 specular = prefilteredColor * (F * brdf.x + brdf.y);
+
+    float3 ambient = (kD * diffuse + specular) * ao;
+
+    float3 finalColor = Lo * gPbrDebug.z + ambient * gPbrDebug.y;
+
+    // HDR -> LDR (Reinhard), затем гамма
+    finalColor = finalColor / (finalColor + 1.f);
     return float4(pow(saturate(finalColor), 1.f / 2.2f), 1.f);
 }

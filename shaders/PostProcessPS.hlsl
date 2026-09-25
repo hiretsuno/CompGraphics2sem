@@ -3,14 +3,15 @@ cbuffer PostCB : register(b0)
     float4 gRTSize;   // x=width, y=height, z=1/width, w=1/height
     float4 gVignette; // x = intensity [0..1], y = radius [0..1] (где начинается затемнение)
     float4 gChroma;   // x = strength (в UV, ~0.006)
-    float4 gFlags;    // x = vignette, y = chroma, z = unused, w = debug view (0=off,1=albedo,2=normal,3=depth)
+    float4 gFlags;    // x = vignette, y = chroma, z = unused, w = debug view (0=off,1=albedo,2=normal,3=depth,4=material)
 };
 
-// Порядок = порядку дескрипторов в SRV-куче GBuffer: слоты 0..2 = G-Buffer, слот 3 = shadow map (тут не нужен), слот 4 = SceneColor
-Texture2D gAlbedoSpecTex  : register(t0);   // rgb = albedo, a = specular intensity
-Texture2D gNormalTex      : register(t1);   // xyz = world normal, w = shininess
+// Порядок = порядку дескрипторов в SRV-куче GBuffer: слоты 0..3 = G-Buffer, слот 4 = shadow map (тут не нужен), слот 5 = SceneColor
+Texture2D gAlbedoSpecTex  : register(t0);   // rgb = albedo
+Texture2D gNormalTex      : register(t1);   // xyz = world normal
 Texture2D gDepthTex       : register(t2);   // R32_FLOAT, NDC depth
-Texture2D gSceneColor     : register(t3);   // R8G8B8A8, уже освещённая сцена (слот 4 кучи, см. root signature)
+Texture2D gMaterialTex    : register(t3);   // r = metallic, g = roughness, b = ao
+Texture2D gSceneColor     : register(t4);   // R8G8B8A8, уже освещённая сцена (слот 5 кучи, см. root signature)
 
 SamplerState gLinearClamp : register(s0);
 
@@ -32,7 +33,9 @@ float4 PostProcessPS(FSOut pin) : SV_TARGET
             return float4(gAlbedoSpecTex.Load(coords).rgb, 1.f);
         if (gFlags.w < 2.5f)
             return float4(normalize(gNormalTex.Load(coords).xyz) * 0.5f + 0.5f, 1.f);
-        return float4(pow(saturate(gDepthTex.Load(coords).r), 50.f).xxx, 1.f);   // NDC-глубина нелинейна, степень растягивает near
+        if (gFlags.w < 3.5f)
+            return float4(pow(saturate(gDepthTex.Load(coords).r), 50.f).xxx, 1.f);   // NDC-глубина нелинейна, степень растягивает near
+        return float4(gMaterialTex.Load(coords).rgb, 1.f);   // R = metallic, G = roughness, B = ao
     }
 
     // ---- Эффект 1: хроматическая аберрация (сдвиг RGB от центра к краям) ----

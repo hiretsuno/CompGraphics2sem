@@ -7,7 +7,8 @@
 class GBuffer
 {
 public:
-    static constexpr uint32_t TargetCount = 3;
+    // 0 = albedo, 1 = normal, 2 = depth, 3 = material (r = metallic, g = roughness, b = ao)
+    static constexpr uint32_t TargetCount = 4;
 
     bool Initialize(ID3D12Device* device, uint32_t width, uint32_t height);
     void Shutdown();
@@ -38,9 +39,22 @@ public:
         return h;
     }
 
+    // Слоты 6..8 — IBL: 0 = irradiance (cube), 1 = prefiltered env (cube + mips), 2 = BRDF LUT (2D).
+    // Кучу Resize не пересоздаёт, так что эти дескрипторы переживают изменение размера окна.
+    static constexpr uint32_t IblFirstSlot = TargetCount + 2;
+    static constexpr uint32_t IblCount = 3;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE GetIblSrvCpu(uint32_t index) const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(IblFirstSlot + index) * m_srvDescriptorSize;
+        return h;
+    }
+
     DXGI_FORMAT GetAlbedoSpecFormat() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
     DXGI_FORMAT GetNormalFormat() const { return DXGI_FORMAT_R16G16B16A16_FLOAT; }
     DXGI_FORMAT GetDepthValueFormat() const { return DXGI_FORMAT_R32_FLOAT; }
+    DXGI_FORMAT GetMaterialFormat() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
     DXGI_FORMAT GetDepthStencilFormat() const { return DXGI_FORMAT_D32_FLOAT; }
 
 private:

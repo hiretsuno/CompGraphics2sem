@@ -70,12 +70,17 @@ void App::Update(float dt)
     if (!m_input || !m_dx12 || !m_window) return;
 
     // Переключение эффектов по фронту нажатия (IsKeyDown — уровень, а не событие).
-    const bool f[3] = { m_input->IsKeyDown(VK_F1), m_input->IsKeyDown(VK_F2), m_input->IsKeyDown(VK_F3) };
+    const bool f[6] = { m_input->IsKeyDown(VK_F1), m_input->IsKeyDown(VK_F2), m_input->IsKeyDown(VK_F3),
+                        m_input->IsKeyDown(VK_F4), m_input->IsKeyDown(VK_F5), m_input->IsKeyDown(VK_F6) };
     if (f[0] && !m_prevF[0]) m_vignetteOn = !m_vignetteOn;
     if (f[1] && !m_prevF[1]) m_chromaOn = !m_chromaOn;
-    if (f[2] && !m_prevF[2]) m_debugView = (m_debugView + 1) % 4;
-    for (int i = 0; i < 3; ++i) m_prevF[i] = f[i];
+    if (f[2] && !m_prevF[2]) m_debugView = (m_debugView + 1) % 5;
+    if (f[3] && !m_prevF[3]) m_pbrOverride = (m_pbrOverride + 1) % 4;
+    if (f[4] && !m_prevF[4]) m_iblOn = !m_iblOn;
+    if (f[5] && !m_prevF[5]) m_directOn = !m_directOn;
+    for (int i = 0; i < 6; ++i) m_prevF[i] = f[i];
     m_dx12->SetPostEffects(m_vignetteOn, m_chromaOn, m_debugView);
+    m_dx12->SetPbrDebug(m_pbrOverride, m_iblOn, m_directOn);
 
     if (m_input->IsKeyDown(VK_RBUTTON))
     {

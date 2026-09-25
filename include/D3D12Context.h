@@ -19,6 +19,7 @@ public:
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
     void SetPostEffects(bool vignette, bool chroma, int debugView);
+    void SetPbrDebug(int materialOverride, bool iblOn, bool directOn);
 
 private:
     std::unique_ptr<RenderingSystem> m_renderer;

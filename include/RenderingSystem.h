@@ -37,20 +37,23 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
-    void SetPostEffects(bool vignette, bool chroma, int debugView);   // debugView: 0=off, 1=albedo, 2=normal, 3=depth
+    void SetPostEffects(bool vignette, bool chroma, int debugView);   // debugView: 0=off, 1=albedo, 2=normal, 3=depth, 4=material (R=metallic G=roughness B=ao)
+    void SetPbrDebug(int materialOverride, bool iblOn, bool directOn);   // для проверки PBR/IBL, см. F4..F6 в App
 
 private:
     struct MaterialConstants
     {
         DirectX::XMFLOAT4 BaseColor{ 1.f, 1.f, 1.f, 1.f };
-        DirectX::XMFLOAT4 SurfaceParams{ 0.18f, 32.f, 0.f, 0.f }; // x = specular intensity, y = shininess
+        DirectX::XMFLOAT4 SurfaceParams{ 0.f, 0.5f, 1.f, 0.f };   // x = metallic, y = roughness, z = ao (константы, если нет текстур)
     };
 
     struct DrawItem
     {
         uint32_t IndexCount = 0;
         uint32_t StartIndexLocation = 0;
-        uint32_t TextureIndex = 0;
+        uint32_t TextureIndex = 0;    // albedo в m_textureHeap (0 = белая заглушка)
+        uint32_t NormalIndex = 1;     // normal map в m_textureHeap (1 = плоская нормаль (0,0,1))
+        uint32_t MetalRoughIndex = 2; // map_MR: G=roughness, B=metallic (2 = (_,1,1) — обе константы проходят как есть)
         MaterialConstants Material;
     };
 
@@ -84,7 +87,9 @@ private:
 
     struct alignas(16) LightConstants
     {
-        DirectX::XMFLOAT4 AmbientColor{ 0.05f, 0.05f, 0.06f, 1.f };
+        // x = подмена материала (0 = из G-buffer, 1 = хром, 2 = шероховатый диэлектрик, 3 = глянцевый диэлектрик),
+        // y = IBL-ambient вкл/выкл, z = прямой свет вкл/выкл
+        DirectX::XMFLOAT4 PbrDebug{ 0.f, 1.f, 1.f, 0.f };
         DirectX::XMFLOAT4 LightCount{ 0.f, 0.f, 0.f, 0.f };
         GpuLight Lights[MaxLights]{};
     };
@@ -102,6 +107,7 @@ private:
     bool BuildPostRootSignature();
     void CreateSceneColor();   // RT для lighting/particles + его SRV в куче GBuffer
     bool BuildGeometry();
+    bool BuildIblResources();   // irradiance / prefiltered env / BRDF LUT + их SRV в куче GBuffer
     bool BuildFrameResources();
 
     void UpdatePassConstants();
@@ -187,6 +193,11 @@ private:
     D3D12_VERTEX_BUFFER_VIEW m_vertexBufferView{};
     D3D12_INDEX_BUFFER_VIEW m_indexBufferView{};
 
+    // IBL (лекция, split-sum): t5 / t6 / t7 в lighting-шейдере
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_irradianceMap;   // TextureCube, диффузная часть
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_prefilterMap;    // TextureCube + mips, зеркальная часть
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_brdfLut;         // Texture2D RG, интеграл BRDF
+
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_textures;
     std::vector<DrawItem> m_drawItems;
 
@@ -206,4 +217,8 @@ private:
     DirectX::XMFLOAT3 m_sunDir{ 0.15f, -0.96f, 0.22f };
 
     float m_time = 0.f;
+
+    int  m_pbrOverride = 0;
+    bool m_iblOn = true;
+    bool m_directOn = true;
 };

@@ -37,6 +37,12 @@ void D3D12Context::SetPostEffects(bool vignette, bool chroma, int debugView)
         m_renderer->SetPostEffects(vignette, chroma, debugView);
 }
 
+void D3D12Context::SetPbrDebug(int materialOverride, bool iblOn, bool directOn)
+{
+    if (m_renderer)
+        m_renderer->SetPbrDebug(materialOverride, iblOn, directOn);
+}
+
 void D3D12Context::SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch)
 {
     if (m_renderer)
