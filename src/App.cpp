@@ -125,7 +125,11 @@ LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         PostQuitMessage(0);
         return 0;
 
-    case WM_KEYDOWN: if (m_input) m_input->OnKeyDown((uint32_t)wparam); return 0;
+    case WM_KEYDOWN:
+        if (m_input) m_input->OnKeyDown((uint32_t)wparam);
+        // F toggles wireframe (bit 30 of lparam = key was already down, i.e. auto-repeat: ignore it)
+        if (wparam == 'F' && !(lparam & (1 << 30)) && m_dx12) m_dx12->ToggleWireframe();
+        return 0;
     case WM_KEYUP: if (m_input) m_input->OnKeyUp((uint32_t)wparam); return 0;
 
     case WM_RBUTTONDOWN:

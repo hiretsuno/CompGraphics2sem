@@ -35,6 +35,7 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
+    void ToggleWireframe() { m_wireframe = !m_wireframe; }
 private:
     struct MaterialConstants
     {
@@ -46,7 +47,12 @@ private:
     {
         uint32_t IndexCount = 0;
         uint32_t StartIndexLocation = 0;
-        uint32_t TextureIndex = 0;
+        // Indices into m_textures (0 = white, 1 = flat normal, 2 = mid-grey height)
+        uint32_t DiffuseTex = 0;
+        uint32_t NormalTex = 1;
+        uint32_t DispTex = 2;
+        // First of three consecutive SRVs (diffuse, normal, disp) in m_textureHeap
+        uint32_t DescriptorIndex = 0;
         MaterialConstants Material;
     };
 
@@ -57,6 +63,8 @@ private:
         DirectX::XMFLOAT4X4 InvViewProj{};
         DirectX::XMFLOAT4 EyePosW{ 0.f, 0.f, 0.f, 1.f };
         DirectX::XMFLOAT4 RenderTargetSize{ 1.f, 1.f, 1.f, 1.f }; // x = width, y = height, z = 1/width, w = 1/height
+        DirectX::XMFLOAT4 TessParams{ 3.f, 25.f, 1.f, 6.f };       // x = near dist (max tess), y = far dist (min tess), z = min factor, w = max factor
+        DirectX::XMFLOAT4 DispParams{ 0.10f, 0.5f, 0.f, 0.f };     // x = displacement scale (model units), y = height that means "no displacement"
     };
 
     struct alignas(16) GpuLight
@@ -133,9 +141,13 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryWirePSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
+    bool m_wireframe = false;
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_geometryHS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_geometryDS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_lightingPS;

@@ -321,6 +321,8 @@ namespace
     struct MtlData
     {
         std::string diffusePath;
+        std::string normalPath;   // map_Bump
+        std::string dispPath;     // disp
         XMFLOAT3 kd{ 1.f, 1.f, 1.f };
         XMFLOAT3 ks{ 0.18f, 0.18f, 0.18f };
         float ns = 32.f;
@@ -370,6 +372,25 @@ namespace
                     last = token;
                 if (!last.empty())
                     materials[currentMaterial].diffusePath = JoinPath(baseDir, last);
+            }
+            else if ((command == "map_Bump" || command == "map_bump" || command == "bump") && !currentMaterial.empty())
+            {
+                // Options such as "-bm 1.0" may precede the file name, so the last token is the path.
+                std::string token;
+                std::string last;
+                while (stream >> token)
+                    last = token;
+                if (!last.empty())
+                    materials[currentMaterial].normalPath = JoinPath(baseDir, last);
+            }
+            else if ((command == "disp" || command == "map_disp") && !currentMaterial.empty())
+            {
+                std::string token;
+                std::string last;
+                while (stream >> token)
+                    last = token;
+                if (!last.empty())
+                    materials[currentMaterial].dispPath = JoinPath(baseDir, last);
             }
         }
 
@@ -650,7 +671,9 @@ namespace
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition.pResource = texture;
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        // The displacement map is read in the Domain Shader, i.e. NOT a pixel shader,
+        // so the texture must also be in the NON_PIXEL_SHADER_RESOURCE state.
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         commandList->ResourceBarrier(1, &barrier);
 
@@ -799,12 +822,13 @@ void RenderingSystem::Draw(float dt)
     m_gBuffer->TransitionToWrite(m_commandList.Get());
     m_gBuffer->BindForGeometryPass(m_commandList.Get());
 
-    m_commandList->SetPipelineState(m_geometryPSO.Get());
+    m_commandList->SetPipelineState(m_wireframe ? m_geometryWirePSO.Get() : m_geometryPSO.Get());
     m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
 
     ID3D12DescriptorHeap* geometryHeaps[] = { m_textureHeap.Get() };
     m_commandList->SetDescriptorHeaps(1, geometryHeaps);
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // Every 3 indices of the index buffer = one triangle patch with 3 control points.
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
     m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
     m_commandList->IASetIndexBuffer(&m_indexBufferView);
 
@@ -812,7 +836,7 @@ void RenderingSystem::Draw(float dt)
     for (const DrawItem& drawItem : m_drawItems)
     {
         D3D12_GPU_DESCRIPTOR_HANDLE textureHandle = textureHeapStart;
-        textureHandle.ptr += static_cast<UINT64>(drawItem.TextureIndex) * m_srvDescriptorSize;
+        textureHandle.ptr += static_cast<UINT64>(drawItem.DescriptorIndex) * m_srvDescriptorSize;
 
         m_commandList->SetGraphicsRootDescriptorTable(1, textureHandle);
         m_commandList->SetGraphicsRoot32BitConstants(2, 8, &drawItem.Material, 0);
@@ -972,6 +996,8 @@ bool RenderingSystem::BuildShaders()
     };
 
     compile("GeometryVS", "vs_5_0", m_geometryVS);
+    compile("GeometryHS", "hs_5_0", m_geometryHS);
+    compile("GeometryDS", "ds_5_0", m_geometryDS);
     compile("GeometryPS", "ps_5_0", m_geometryPS);
     compile("LightingVS", "vs_5_0", m_lightingVS);
     compile("LightingPS", "ps_5_0", m_lightingPS);
@@ -984,12 +1010,20 @@ bool RenderingSystem::BuildShaders()
 
 bool RenderingSystem::BuildRootSignature()
 {
-    D3D12_DESCRIPTOR_RANGE textureRange{};
-    textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    textureRange.NumDescriptors = 1;
-    textureRange.BaseShaderRegister = 0;
-    textureRange.RegisterSpace = 0;
-    textureRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    // Material table, 3 consecutive descriptors in the heap: diffuse (t0), normal map (t4), displacement map (t5).
+    // t1..t3 are already taken by the G-buffer table below, so the extra maps start at t4.
+    D3D12_DESCRIPTOR_RANGE textureRanges[2]{};
+    textureRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    textureRanges[0].NumDescriptors = 1;
+    textureRanges[0].BaseShaderRegister = 0;
+    textureRanges[0].RegisterSpace = 0;
+    textureRanges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    textureRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    textureRanges[1].NumDescriptors = 2;
+    textureRanges[1].BaseShaderRegister = 4;
+    textureRanges[1].RegisterSpace = 0;
+    textureRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
     D3D12_DESCRIPTOR_RANGE gbufferRange{};
     gbufferRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -1006,9 +1040,10 @@ bool RenderingSystem::BuildRootSignature()
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 1;
-    params[1].DescriptorTable.pDescriptorRanges = &textureRange;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].DescriptorTable.NumDescriptorRanges = 2;
+    params[1].DescriptorTable.pDescriptorRanges = textureRanges;
+    // Displacement is sampled in the Domain Shader, diffuse and normal in the Pixel Shader.
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[2].Constants.ShaderRegister = 2;
@@ -1039,7 +1074,7 @@ bool RenderingSystem::BuildRootSignature()
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderRegister = 0;
     sampler.RegisterSpace = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL; // the Domain Shader samples the height map too
 
     D3D12_ROOT_SIGNATURE_DESC desc{};
     desc.NumParameters = static_cast<UINT>(_countof(params));
@@ -1101,13 +1136,16 @@ bool RenderingSystem::BuildPSOs()
     D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryPso{};
     geometryPso.pRootSignature = m_rootSignature.Get();
     geometryPso.VS = { m_geometryVS->GetBufferPointer(), m_geometryVS->GetBufferSize() };
+    geometryPso.HS = { m_geometryHS->GetBufferPointer(), m_geometryHS->GetBufferSize() };
+    geometryPso.DS = { m_geometryDS->GetBufferPointer(), m_geometryDS->GetBufferSize() };
     geometryPso.PS = { m_geometryPS->GetBufferPointer(), m_geometryPS->GetBufferSize() };
     geometryPso.BlendState = blend;
     geometryPso.SampleMask = UINT_MAX;
     geometryPso.RasterizerState = rasterizer;
     geometryPso.DepthStencilState = geometryDepth;
     geometryPso.InputLayout = { m_inputLayout, static_cast<UINT>(_countof(m_inputLayout)) };
-    geometryPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    // With tessellation the input assembler feeds PATCHES (control points), not triangles.
+    geometryPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
     geometryPso.NumRenderTargets = 3;
     geometryPso.RTVFormats[0] = m_gBuffer->GetAlbedoSpecFormat();
     geometryPso.RTVFormats[1] = m_gBuffer->GetNormalFormat();
@@ -1116,6 +1154,11 @@ bool RenderingSystem::BuildPSOs()
     geometryPso.SampleDesc.Count = 1;
     geometryPso.SampleDesc.Quality = 0;
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&geometryPso, IID_PPV_ARGS(&m_geometryPSO)), "Create geometry PSO");
+
+    // Same pipeline, but drawn as a wireframe so the tessellation density is visible (toggle with F).
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryWirePso = geometryPso;
+    geometryWirePso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&geometryWirePso, IID_PPV_ARGS(&m_geometryWirePSO)), "Create wireframe geometry PSO");
 
     D3D12_DEPTH_STENCIL_DESC lightingDepth{};
     lightingDepth.DepthEnable = FALSE;
@@ -1150,12 +1193,15 @@ bool RenderingSystem::BuildGeometry()
     std::unordered_map<std::string, uint32_t> pathToIndex;
     std::vector<std::string> uniquePaths;
 
-    auto getTextureIndex = [&](const std::string& path) -> uint32_t
+    // m_textures layout: [0] = white, [1] = flat normal, [2] = mid-grey height, [3...] = files from the .mtl.
+    constexpr uint32_t kDefaultTextureCount = 3;
+
+    auto getTextureIndex = [&](const std::string& path, uint32_t fallback) -> uint32_t
     {
         if (path.empty())
-            return 0;
+            return fallback;
 
-        auto [it, inserted] = pathToIndex.emplace(path, static_cast<uint32_t>(uniquePaths.size()) + 1u);
+        auto [it, inserted] = pathToIndex.emplace(path, static_cast<uint32_t>(uniquePaths.size()) + kDefaultTextureCount);
         if (inserted)
             uniquePaths.push_back(path);
         return it->second;
@@ -1168,12 +1214,15 @@ bool RenderingSystem::BuildGeometry()
         DrawItem drawItem{};
         drawItem.StartIndexLocation = group.start;
         drawItem.IndexCount = group.count;
+        drawItem.DescriptorIndex = static_cast<uint32_t>(m_drawItems.size()) * 3u;
 
         const auto materialIt = model.materials.find(group.material);
         if (materialIt != model.materials.end())
         {
             const MtlData& material = materialIt->second;
-            drawItem.TextureIndex = getTextureIndex(material.diffusePath);
+            drawItem.DiffuseTex = getTextureIndex(material.diffusePath, 0);
+            drawItem.NormalTex = getTextureIndex(material.normalPath, 1);
+            drawItem.DispTex = getTextureIndex(material.dispPath, 2);
             drawItem.Material.BaseColor = XMFLOAT4(material.kd.x, material.kd.y, material.kd.z, 1.f);
             const float ksAverage = (material.ks.x + material.ks.y + material.ks.z) / 3.f;
             drawItem.Material.SurfaceParams.x = std::max(0.04f, ksAverage);
@@ -1234,15 +1283,30 @@ bool RenderingSystem::BuildGeometry()
         return texture;
     };
 
+    // If a file failed to load, fall back to the matching default texture (white / flat normal / mid-grey height).
+    auto fixMissing = [&](uint32_t& texIndex, uint32_t fallback)
+    {
+        if (texIndex >= kDefaultTextureCount && !loaded[texIndex - kDefaultTextureCount])
+            texIndex = fallback;
+    };
+    for (DrawItem& item : m_drawItems)
+    {
+        fixMissing(item.DiffuseTex, 0);
+        fixMissing(item.NormalTex, 1);
+        fixMissing(item.DispTex, 2);
+    }
+
     m_textures.clear();
-    m_textures.resize(uniquePaths.size() + 1u);
+    m_textures.resize(uniquePaths.size() + kDefaultTextureCount);
     m_textures[0] = createTexture(1, 1);
+    m_textures[1] = createTexture(1, 1);
+    m_textures[2] = createTexture(1, 1);
     for (size_t i = 0; i < uniquePaths.size(); ++i)
     {
         if (loaded[i])
-            m_textures[i + 1] = createTexture(images[i].width, images[i].height);
+            m_textures[i + kDefaultTextureCount] = createTexture(images[i].width, images[i].height);
         else
-            m_textures[i + 1] = m_textures[0];
+            m_textures[i + kDefaultTextureCount] = m_textures[0];
     }
 
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator for geometry upload");
@@ -1273,11 +1337,29 @@ bool RenderingSystem::BuildGeometry()
     whiteTexture.bgra = { 255, 255, 255, 255 };
     UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[0].Get(), whiteTexture, textureUploads);
 
+    // Flat normal (0,0,1) encoded as RGB = (128,128,255); stored as BGRA.
+    Image flatNormalTexture;
+    flatNormalTexture.width = 1;
+    flatNormalTexture.height = 1;
+    flatNormalTexture.bgra = { 255, 128, 128, 255 };
+    UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[1].Get(), flatNormalTexture, textureUploads);
+
+    // Mid-grey height = "no displacement" together with DispParams.y = 0.5.
+    Image flatHeightTexture;
+    flatHeightTexture.width = 1;
+    flatHeightTexture.height = 1;
+    flatHeightTexture.bgra = { 128, 128, 128, 255 };
+    UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[2].Get(), flatHeightTexture, textureUploads);
+
     for (size_t i = 0; i < uniquePaths.size(); ++i)
     {
         if (loaded[i])
-            UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[i + 1].Get(), images[i], textureUploads);
+            UploadTexture(m_device.Get(), m_commandList.Get(), m_textures[i + kDefaultTextureCount].Get(), images[i], textureUploads);
     }
+
+    // Upload buffers already hold a copy of the pixels; free the CPU-side 4K images early.
+    images.clear();
+    images.shrink_to_fit();
 
     ThrowIfFailed(m_commandList->Close(), "Close geometry upload command list");
     ID3D12CommandList* uploadLists[] = { m_commandList.Get() };
@@ -1293,21 +1375,26 @@ bool RenderingSystem::BuildGeometry()
     m_indexBufferView.Format = DXGI_FORMAT_R32_UINT;
 
     D3D12_DESCRIPTOR_HEAP_DESC textureHeapDesc{};
-    textureHeapDesc.NumDescriptors = static_cast<UINT>(m_textures.size());
+    // 3 consecutive descriptors per draw item: [diffuse, normal, displacement] -> registers t0, t4, t5.
+    textureHeapDesc.NumDescriptors = std::max<UINT>(1u, static_cast<UINT>(m_drawItems.size()) * 3u);
     textureHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     textureHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(m_device->CreateDescriptorHeap(&textureHeapDesc, IID_PPV_ARGS(&m_textureHeap)), "Create texture heap");
 
     D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_textureHeap->GetCPUDescriptorHandleForHeapStart();
-    for (size_t i = 0; i < m_textures.size(); ++i)
+    for (const DrawItem& item : m_drawItems)
     {
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        m_device->CreateShaderResourceView(m_textures[i].Get(), &srvDesc, srvHandle);
-        srvHandle.ptr += m_srvDescriptorSize;
+        const uint32_t texIndices[3] = { item.DiffuseTex, item.NormalTex, item.DispTex };
+        for (uint32_t texIndex : texIndices)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+            m_device->CreateShaderResourceView(m_textures[texIndex].Get(), &srvDesc, srvHandle);
+            srvHandle.ptr += m_srvDescriptorSize;
+        }
     }
 
     return true;
@@ -1458,4 +1545,4 @@ D3D12_CPU_DESCRIPTOR_HANDLE RenderingSystem::CurrentBackBufferRTV() const
 ID3D12Resource* RenderingSystem::CurrentBackBuffer() const
 {
     return m_backBuffers[m_backBufferIndex].Get();
-}
+}

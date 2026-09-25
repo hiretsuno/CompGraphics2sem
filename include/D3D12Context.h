@@ -18,6 +18,7 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
+    void ToggleWireframe();
 
 private:
     std::unique_ptr<RenderingSystem> m_renderer;
