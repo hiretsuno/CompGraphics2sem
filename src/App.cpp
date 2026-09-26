@@ -22,7 +22,7 @@ bool App::Initialize(HINSTANCE hInstance, int nCmdShow)
     m_input = new Input();
     m_input->Reset();
 
-    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-5"))
+    if (!m_window->Create(this, hInstance, nCmdShow, 1280, 720, L"Lab-2"))
         return false;
 
     m_secondsPerTick = 1./GetQpf();
