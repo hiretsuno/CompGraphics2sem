@@ -702,6 +702,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     BuildShaders();
     BuildRootSignature();
     BuildGeometry();
+    BuildLightVolumes();
     BuildFrameResources();
 
     m_gBuffer = std::make_unique<GBuffer>();
@@ -709,7 +710,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
 
     CreateSceneLights();
     UpdatePassConstants();
-    UpdateLightConstants(0.f);
+    UpdateLights(0.f);
     BuildPSOs();
 
     m_initialized = true;
@@ -727,10 +728,10 @@ void RenderingSystem::Shutdown()
         m_mappedPassConstants = nullptr;
     }
 
-    if (m_lightConstantBuffer && m_mappedLightConstants)
+    if (m_lightBuffer && m_mappedLights)
     {
-        m_lightConstantBuffer->Unmap(0, nullptr);
-        m_mappedLightConstants = nullptr;
+        m_lightBuffer->Unmap(0, nullptr);
+        m_mappedLights = nullptr;
     }
 
     if (m_gBuffer)
@@ -784,7 +785,7 @@ void RenderingSystem::Draw(float dt)
         return;
 
     UpdatePassConstants();
-    UpdateLightConstants(dt);
+    UpdateLights(dt);
 
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator");
     ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), nullptr), "Reset command list");
@@ -793,6 +794,9 @@ void RenderingSystem::Draw(float dt)
     m_commandList->RSSetScissorRects(1, &m_scissorRect);
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
 
+    // ---------------------------------------------------------------------------------
+    // 1. GEOMETRY PASS: сцена -> G-buffer (albedo/spec, normal/shininess, depth)
+    // ---------------------------------------------------------------------------------
     m_gBuffer->TransitionToWrite(m_commandList.Get());
     m_gBuffer->BindForGeometryPass(m_commandList.Get());
 
@@ -816,6 +820,10 @@ void RenderingSystem::Draw(float dt)
         m_commandList->DrawIndexedInstanced(drawItem.IndexCount, 1, drawItem.StartIndexLocation, 0, 0);
     }
 
+    // ---------------------------------------------------------------------------------
+    // 2. LIGHTING PASS: G-buffer -> back buffer, по одному draw call на тип источника,
+    //    результаты складываются аддитивно
+    // ---------------------------------------------------------------------------------
     m_gBuffer->TransitionToRead(m_commandList.Get());
 
     D3D12_RESOURCE_BARRIER toRenderTarget{};
@@ -826,20 +834,58 @@ void RenderingSystem::Draw(float dt)
     toRenderTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     m_commandList->ResourceBarrier(1, &toRenderTarget);
 
+    // Read-only DSV: глубина сцены используется для depth test световых объёмов,
+    // и одновременно та же глубина читается шейдером через SRV
     const auto backBufferRtv = CurrentBackBufferRTV();
+    const auto readOnlyDsv = m_gBuffer->GetReadOnlyDsv();
     const float clearColor[4] = { 0.f, 0.f, 0.f, 1.f };
-    m_commandList->OMSetRenderTargets(1, &backBufferRtv, TRUE, nullptr);
+    m_commandList->OMSetRenderTargets(1, &backBufferRtv, TRUE, &readOnlyDsv);
     m_commandList->ClearRenderTargetView(backBufferRtv, clearColor, 0, nullptr);
-
-    m_commandList->SetPipelineState(m_lightingPSO.Get());
-    m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
-    m_commandList->SetGraphicsRootConstantBufferView(3, m_lightConstantBuffer->GetGPUVirtualAddress());
 
     ID3D12DescriptorHeap* lightingHeaps[] = { m_gBuffer->GetSrvHeap() };
     m_commandList->SetDescriptorHeaps(1, lightingHeaps);
+    m_commandList->SetGraphicsRootConstantBufferView(0, m_passConstantBuffer->GetGPUVirtualAddress());
     m_commandList->SetGraphicsRootDescriptorTable(4, m_gBuffer->GetSrvTable());
+    m_commandList->SetGraphicsRootShaderResourceView(5, m_lightBuffer->GetGPUVirtualAddress());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    auto setLightOffset = [&](uint32_t offset)
+    {
+        m_lightPass.LightOffset = offset;
+        m_commandList->SetGraphicsRoot32BitConstants(3, sizeof(LightPassConstants) / 4, &m_lightPass, 0);
+    };
+
+    // 2a. Ambient — полноэкранный треугольник, перезаписывает цвет
+    setLightOffset(0);
+    m_commandList->SetPipelineState(m_ambientPSO.Get());
     m_commandList->DrawInstanced(3, 1, 0, 0);
+
+    // 2b. Directional — полноэкранный треугольник на каждый источник, additive
+    if (m_directionalCount > 0)
+    {
+        setLightOffset(0);
+        m_commandList->SetPipelineState(m_directionalPSO.Get());
+        m_commandList->DrawInstanced(3, m_directionalCount, 0, 0);
+    }
+
+    // 2c. Point / Spot — световые объёмы (сфера / конус), instancing: 1 инстанс = 1 источник
+    if (m_pointCount + m_spotCount > 0)
+    {
+        m_commandList->SetPipelineState(m_lightVolumePSO.Get());
+        m_commandList->IASetVertexBuffers(0, 1, &m_volumeVBView);
+        m_commandList->IASetIndexBuffer(&m_volumeIBView);
+
+        if (m_pointCount > 0)
+        {
+            setLightOffset(m_directionalCount);
+            m_commandList->DrawIndexedInstanced(m_sphereMesh.IndexCount, m_pointCount, m_sphereMesh.StartIndex, m_sphereMesh.BaseVertex, 0);
+        }
+        if (m_spotCount > 0)
+        {
+            setLightOffset(m_directionalCount + m_pointCount);
+            m_commandList->DrawIndexedInstanced(m_coneMesh.IndexCount, m_spotCount, m_coneMesh.StartIndex, m_coneMesh.BaseVertex, 0);
+        }
+    }
 
     D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -970,12 +1016,17 @@ bool RenderingSystem::BuildShaders()
 
     compile("GeometryVS", "vs_5_0", m_geometryVS);
     compile("GeometryPS", "ps_5_0", m_geometryPS);
-    compile("LightingVS", "vs_5_0", m_lightingVS);
-    compile("LightingPS", "ps_5_0", m_lightingPS);
+    compile("FullscreenVS", "vs_5_0", m_fullscreenVS);
+    compile("AmbientPS", "ps_5_0", m_ambientPS);
+    compile("DirectionalPS", "ps_5_0", m_directionalPS);
+    compile("LightVolumeVS", "vs_5_0", m_lightVolumeVS);
+    compile("LightVolumePS", "ps_5_0", m_lightVolumePS);
 
     m_inputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[1] = { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[2] = { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+
+    m_volumeInputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     return true;
 }
 
@@ -995,7 +1046,13 @@ bool RenderingSystem::BuildRootSignature()
     gbufferRange.RegisterSpace = 0;
     gbufferRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[5]{};
+    // 0: CBV  b0      PassCB                     (все проходы)
+    // 1: table t0      diffuse texture            (geometry)
+    // 2: const b2      MaterialCB                 (geometry)
+    // 3: const b1      LightPassCB (ambient, offset)   (lighting)
+    // 4: table t1..t3  G-buffer: albedo, normal, depth (lighting)
+    // 5: SRV   t4      StructuredBuffer<GpuLight>      (lighting)
+    D3D12_ROOT_PARAMETER params[6]{};
 
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
@@ -1013,15 +1070,21 @@ bool RenderingSystem::BuildRootSignature()
     params[2].Constants.Num32BitValues = 8;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[3].Descriptor.ShaderRegister = 1;
-    params[3].Descriptor.RegisterSpace = 0;
-    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[3].Constants.ShaderRegister = 1;
+    params[3].Constants.RegisterSpace = 0;
+    params[3].Constants.Num32BitValues = sizeof(LightPassConstants) / 4;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[4].DescriptorTable.NumDescriptorRanges = 1;
     params[4].DescriptorTable.pDescriptorRanges = &gbufferRange;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[5].Descriptor.ShaderRegister = 4;
+    params[5].Descriptor.RegisterSpace = 0;
+    params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1105,35 +1168,73 @@ bool RenderingSystem::BuildPSOs()
     geometryPso.DepthStencilState = geometryDepth;
     geometryPso.InputLayout = { m_inputLayout, static_cast<UINT>(_countof(m_inputLayout)) };
     geometryPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    geometryPso.NumRenderTargets = 3;
+    geometryPso.NumRenderTargets = GBuffer::TargetCount;
     geometryPso.RTVFormats[0] = m_gBuffer->GetAlbedoSpecFormat();
     geometryPso.RTVFormats[1] = m_gBuffer->GetNormalFormat();
-    geometryPso.RTVFormats[2] = m_gBuffer->GetDepthValueFormat();
     geometryPso.DSVFormat = m_gBuffer->GetDepthStencilFormat();
     geometryPso.SampleDesc.Count = 1;
     geometryPso.SampleDesc.Quality = 0;
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&geometryPso, IID_PPV_ARGS(&m_geometryPSO)), "Create geometry PSO");
 
-    D3D12_DEPTH_STENCIL_DESC lightingDepth{};
-    lightingDepth.DepthEnable = FALSE;
-    lightingDepth.StencilEnable = FALSE;
+    // Additive blending: каждый источник добавляет свой вклад к уже накопленному цвету
+    D3D12_BLEND_DESC additiveBlend = blend;
+    additiveBlend.RenderTarget[0].BlendEnable = TRUE;
+    additiveBlend.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    additiveBlend.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+    additiveBlend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
 
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC lightingPso{};
-    lightingPso.pRootSignature = m_rootSignature.Get();
-    lightingPso.VS = { m_lightingVS->GetBufferPointer(), m_lightingVS->GetBufferSize() };
-    lightingPso.PS = { m_lightingPS->GetBufferPointer(), m_lightingPS->GetBufferSize() };
-    lightingPso.BlendState = blend;
-    lightingPso.SampleMask = UINT_MAX;
-    lightingPso.RasterizerState = rasterizer;
-    lightingPso.DepthStencilState = lightingDepth;
-    lightingPso.InputLayout = { nullptr, 0 };
-    lightingPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    lightingPso.NumRenderTargets = 1;
-    lightingPso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    lightingPso.DSVFormat = DXGI_FORMAT_UNKNOWN;
-    lightingPso.SampleDesc.Count = 1;
-    lightingPso.SampleDesc.Quality = 0;
-    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&lightingPso, IID_PPV_ARGS(&m_lightingPSO)), "Create lighting PSO");
+    D3D12_DEPTH_STENCIL_DESC noDepth{};
+    noDepth.DepthEnable = FALSE;
+    noDepth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    noDepth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    noDepth.StencilEnable = FALSE;
+
+    // Fullscreen-проходы (ambient, directional)
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC fullscreenPso{};
+    fullscreenPso.pRootSignature = m_rootSignature.Get();
+    fullscreenPso.VS = { m_fullscreenVS->GetBufferPointer(), m_fullscreenVS->GetBufferSize() };
+    fullscreenPso.PS = { m_ambientPS->GetBufferPointer(), m_ambientPS->GetBufferSize() };
+    fullscreenPso.BlendState = blend;
+    fullscreenPso.SampleMask = UINT_MAX;
+    fullscreenPso.RasterizerState = rasterizer;
+    fullscreenPso.DepthStencilState = noDepth;
+    fullscreenPso.InputLayout = { nullptr, 0 };
+    fullscreenPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    fullscreenPso.NumRenderTargets = 1;
+    fullscreenPso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    fullscreenPso.DSVFormat = m_gBuffer->GetDepthStencilFormat();
+    fullscreenPso.SampleDesc.Count = 1;
+    fullscreenPso.SampleDesc.Quality = 0;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&fullscreenPso, IID_PPV_ARGS(&m_ambientPSO)), "Create ambient PSO");
+
+    fullscreenPso.PS = { m_directionalPS->GetBufferPointer(), m_directionalPS->GetBufferSize() };
+    fullscreenPso.BlendState = additiveBlend;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&fullscreenPso, IID_PPV_ARGS(&m_directionalPSO)), "Create directional PSO");
+
+    // Световые объёмы (point / spot):
+    //  - рисуем только ЗАДНИЕ грани (cull front) — работает и когда камера внутри объёма;
+    //  - depth test GREATER_EQUAL без записи: пиксель проходит, если поверхность сцены
+    //    находится перед задней стенкой объёма (т.е. потенциально внутри него);
+    //  - depth clip выключен, чтобы дальняя стенка не обрезалась far-плоскостью.
+    D3D12_RASTERIZER_DESC volumeRasterizer = rasterizer;
+    volumeRasterizer.CullMode = D3D12_CULL_MODE_FRONT;
+    volumeRasterizer.FrontCounterClockwise = FALSE; // меш объёмов строится с CW-гранями снаружи
+    volumeRasterizer.DepthClipEnable = FALSE;
+
+    D3D12_DEPTH_STENCIL_DESC volumeDepth{};
+    volumeDepth.DepthEnable = TRUE;
+    volumeDepth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    volumeDepth.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    volumeDepth.StencilEnable = FALSE;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC volumePso = fullscreenPso;
+    volumePso.VS = { m_lightVolumeVS->GetBufferPointer(), m_lightVolumeVS->GetBufferSize() };
+    volumePso.PS = { m_lightVolumePS->GetBufferPointer(), m_lightVolumePS->GetBufferSize() };
+    volumePso.BlendState = additiveBlend;
+    volumePso.RasterizerState = volumeRasterizer;
+    volumePso.DepthStencilState = volumeDepth;
+    volumePso.InputLayout = { m_volumeInputLayout, static_cast<UINT>(_countof(m_volumeInputLayout)) };
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&volumePso, IID_PPV_ARGS(&m_lightVolumePSO)), "Create light volume PSO");
 
     return true;
 }
@@ -1315,21 +1416,146 @@ bool RenderingSystem::BuildFrameResources()
     auto uploadHeap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
 
     const uint32_t passCbSize = AlignConstantBufferSize(sizeof(PassConstants));
-    const uint32_t lightCbSize = AlignConstantBufferSize(sizeof(LightConstants));
-
     const D3D12_RESOURCE_DESC passDesc = BufferDesc(passCbSize);
     ThrowIfFailed(
         m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &passDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_passConstantBuffer)),
         "Create pass constant buffer");
 
-    const D3D12_RESOURCE_DESC lightDesc = BufferDesc(lightCbSize);
+    // StructuredBuffer<GpuLight> — привязывается как root SRV (t4)
+    const D3D12_RESOURCE_DESC lightDesc = BufferDesc(static_cast<UINT64>(MaxLights) * sizeof(GpuLight));
     ThrowIfFailed(
-        m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &lightDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_lightConstantBuffer)),
-        "Create light constant buffer");
+        m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &lightDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_lightBuffer)),
+        "Create light buffer");
 
     D3D12_RANGE readRange{ 0, 0 };
     ThrowIfFailed(m_passConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_mappedPassConstants)), "Map pass constant buffer");
-    ThrowIfFailed(m_lightConstantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_mappedLightConstants)), "Map light constant buffer");
+    ThrowIfFailed(m_lightBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_mappedLights)), "Map light buffer");
+    return true;
+}
+
+bool RenderingSystem::BuildLightVolumes()
+{
+    std::vector<XMFLOAT3> vertices;
+    std::vector<uint32_t> indices;
+
+    // Добавляет треугольник так, чтобы снаружи он был CW (cross(b-a, c-a) смотрит наружу).
+    // interior — любая точка внутри выпуклого меша.
+    auto addTriangle = [&](uint32_t base, uint32_t i0, uint32_t i1, uint32_t i2, const XMFLOAT3& interior)
+    {
+        const XMVECTOR a = XMLoadFloat3(&vertices[base + i0]);
+        const XMVECTOR b = XMLoadFloat3(&vertices[base + i1]);
+        const XMVECTOR c = XMLoadFloat3(&vertices[base + i2]);
+        const XMVECTOR n = XMVector3Cross(XMVectorSubtract(b, a), XMVectorSubtract(c, a));
+        const XMVECTOR centroid = XMVectorScale(XMVectorAdd(XMVectorAdd(a, b), c), 1.f / 3.f);
+        const XMVECTOR outward = XMVectorSubtract(centroid, XMLoadFloat3(&interior));
+
+        indices.push_back(i0);
+        if (XMVectorGetX(XMVector3Dot(n, outward)) >= 0.f)
+        {
+            indices.push_back(i1);
+            indices.push_back(i2);
+        }
+        else
+        {
+            indices.push_back(i2);
+            indices.push_back(i1);
+        }
+    };
+
+    // Сфера (UV-sphere). Вершины лежат на сфере, а грани — внутри неё,
+    //     поэтому радиус чуть увеличен, чтобы многогранник целиком охватывал range.
+    {
+        const uint32_t stacks = 12;
+        const uint32_t slices = 16;
+        const float radius = 1.f / std::cos(XM_PI / static_cast<float>(slices)) * 1.03f;
+        const uint32_t base = static_cast<uint32_t>(vertices.size());
+        m_sphereMesh.StartIndex = static_cast<uint32_t>(indices.size());
+        m_sphereMesh.BaseVertex = static_cast<int32_t>(base);
+
+        for (uint32_t i = 0; i <= stacks; ++i)
+        {
+            const float phi = XM_PI * static_cast<float>(i) / static_cast<float>(stacks);
+            for (uint32_t j = 0; j <= slices; ++j)
+            {
+                const float theta = XM_2PI * static_cast<float>(j) / static_cast<float>(slices);
+                vertices.push_back(XMFLOAT3(
+                    radius * std::sin(phi) * std::cos(theta),
+                    radius * std::cos(phi),
+                    radius * std::sin(phi) * std::sin(theta)));
+            }
+        }
+
+        const XMFLOAT3 center(0.f, 0.f, 0.f);
+        for (uint32_t i = 0; i < stacks; ++i)
+        {
+            for (uint32_t j = 0; j < slices; ++j)
+            {
+                const uint32_t v0 = i * (slices + 1) + j;
+                const uint32_t v1 = v0 + 1;
+                const uint32_t v2 = v0 + (slices + 1);
+                const uint32_t v3 = v2 + 1;
+                if (i != 0)          addTriangle(base, v0, v1, v2, center);
+                if (i != stacks - 1) addTriangle(base, v1, v3, v2, center);
+            }
+        }
+        m_sphereMesh.IndexCount = static_cast<uint32_t>(indices.size()) - m_sphereMesh.StartIndex;
+    }
+
+    // --- Конус: вершина в (0,0,0), ось +Z, длина 1, радиус основания 1 (с запасом на полигональность)
+    {
+        const uint32_t segments = 16;
+        const float radius = 1.f / std::cos(XM_PI / static_cast<float>(segments)) * 1.03f;
+        const uint32_t base = static_cast<uint32_t>(vertices.size());
+        m_coneMesh.StartIndex = static_cast<uint32_t>(indices.size());
+        m_coneMesh.BaseVertex = static_cast<int32_t>(base);
+
+        vertices.push_back(XMFLOAT3(0.f, 0.f, 0.f)); // 0 — вершина конуса (позиция источника)
+        vertices.push_back(XMFLOAT3(0.f, 0.f, 1.f)); // 1 — центр основания
+        for (uint32_t j = 0; j < segments; ++j)
+        {
+            const float theta = XM_2PI * static_cast<float>(j) / static_cast<float>(segments);
+            vertices.push_back(XMFLOAT3(radius * std::cos(theta), radius * std::sin(theta), 1.f));
+        }
+
+        const XMFLOAT3 interior(0.f, 0.f, 0.75f);
+        for (uint32_t j = 0; j < segments; ++j)
+        {
+            const uint32_t a = 2 + j;
+            const uint32_t b = 2 + (j + 1) % segments;
+            addTriangle(base, 0, a, b, interior); // боковая поверхность
+            addTriangle(base, 1, b, a, interior); // основание
+        }
+        m_coneMesh.IndexCount = static_cast<uint32_t>(indices.size()) - m_coneMesh.StartIndex;
+    }
+
+    // Меши маленькие и статические upload heap достаточно
+    auto uploadHeap = HeapProps(D3D12_HEAP_TYPE_UPLOAD);
+    auto createUploadBuffer = [&](UINT64 size, const void* data, ComPtr<ID3D12Resource>& resource)
+    {
+        const D3D12_RESOURCE_DESC desc = BufferDesc(size);
+        ThrowIfFailed(
+            m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&resource)),
+            "Create light volume buffer");
+
+        void* mapped = nullptr;
+        D3D12_RANGE readRange{ 0, 0 };
+        ThrowIfFailed(resource->Map(0, &readRange, &mapped), "Map light volume buffer");
+        std::memcpy(mapped, data, static_cast<size_t>(size));
+        resource->Unmap(0, nullptr);
+    };
+
+    const UINT64 vbSize = static_cast<UINT64>(vertices.size()) * sizeof(XMFLOAT3);
+    const UINT64 ibSize = static_cast<UINT64>(indices.size()) * sizeof(uint32_t);
+    createUploadBuffer(vbSize, vertices.data(), m_volumeVertexBuffer);
+    createUploadBuffer(ibSize, indices.data(), m_volumeIndexBuffer);
+
+    m_volumeVBView.BufferLocation = m_volumeVertexBuffer->GetGPUVirtualAddress();
+    m_volumeVBView.SizeInBytes = static_cast<UINT>(vbSize);
+    m_volumeVBView.StrideInBytes = sizeof(XMFLOAT3);
+
+    m_volumeIBView.BufferLocation = m_volumeIndexBuffer->GetGPUVirtualAddress();
+    m_volumeIBView.SizeInBytes = static_cast<UINT>(ibSize);
+    m_volumeIBView.Format = DXGI_FORMAT_R32_UINT;
     return true;
 }
 
@@ -1360,32 +1586,40 @@ void RenderingSystem::UpdatePassConstants()
     std::memcpy(m_mappedPassConstants, &constants, sizeof(constants));
 }
 
-void RenderingSystem::UpdateLightConstants(float dt)
+void RenderingSystem::UpdateLights(float dt)
 {
-    if (!m_mappedLightConstants)
+    if (!m_mappedLights)
         return;
 
     m_time += dt;
 
-    LightConstants constants{};
-    constants.AmbientColor = XMFLOAT4(0.055f, 0.055f, 0.06f, 1.f);
+    // Раскладываем источники в GPU-буфер группами: [directional][point][spot].
+    // Каждая группа потом рисуется одним instanced draw call.
+    uint32_t written = 0;
+    uint32_t counts[3] = { 0, 0, 0 };
 
-    const uint32_t lightCount = static_cast<uint32_t>(std::min<size_t>(m_sceneLights.size(), MaxLights));
-    constants.LightCount = XMFLOAT4(static_cast<float>(lightCount), 0.f, 0.f, 0.f);
-
-    for (uint32_t i = 0; i < lightCount; ++i)
+    for (uint32_t type = LightDirectional; type <= LightSpot; ++type)
     {
-        GpuLight light = m_sceneLights[i];
-        const float type = light.Params.x;
-        if (type > 0.5f)
+        for (size_t i = 0; i < m_sceneLights.size() && written < MaxLights; ++i)
         {
-            const float pulse = 0.9f + 0.1f * std::sinf(m_time * 1.35f + static_cast<float>(i) * 0.75f);
-            light.ColorIntensity.w *= pulse;
+            GpuLight light = m_sceneLights[i];
+            if (static_cast<uint32_t>(light.Params.x) != type)
+                continue;
+
+            if (type != LightDirectional)
+            {
+                const float pulse = 0.9f + 0.1f * std::sinf(m_time * 1.35f + static_cast<float>(i) * 0.75f);
+                light.ColorIntensity.w *= pulse;
+            }
+
+            m_mappedLights[written++] = light;
+            ++counts[type];
         }
-        constants.Lights[i] = light;
     }
 
-    std::memcpy(m_mappedLightConstants, &constants, sizeof(constants));
+    m_directionalCount = counts[LightDirectional];
+    m_pointCount = counts[LightPoint];
+    m_spotCount = counts[LightSpot];
 }
 
 void RenderingSystem::CreateSceneLights()
@@ -1403,7 +1637,7 @@ void RenderingSystem::CreateSceneLights()
         const XMFLOAT3 dir = normalize(direction);
         light.DirectionSpot = XMFLOAT4(dir.x, dir.y, dir.z, 0.f);
         light.ColorIntensity = XMFLOAT4(color.x, color.y, color.z, intensity);
-        light.Params = XMFLOAT4(0.f, 0.f, 0.f, 0.f);
+        light.Params = XMFLOAT4(static_cast<float>(LightDirectional), 0.f, 0.f, 0.f);
         return light;
     };
 
@@ -1412,7 +1646,7 @@ void RenderingSystem::CreateSceneLights()
         GpuLight light{};
         light.PositionRange = XMFLOAT4(position.x, position.y, position.z, range);
         light.ColorIntensity = XMFLOAT4(color.x, color.y, color.z, intensity);
-        light.Params = XMFLOAT4(1.f, 0.f, 0.f, 0.f);
+        light.Params = XMFLOAT4(static_cast<float>(LightPoint), 0.f, 0.f, 0.f);
         return light;
     };
 
@@ -1426,30 +1660,32 @@ void RenderingSystem::CreateSceneLights()
         light.PositionRange = XMFLOAT4(position.x, position.y, position.z, range);
         light.DirectionSpot = XMFLOAT4(dir.x, dir.y, dir.z, std::cos(outerAngle));
         light.ColorIntensity = XMFLOAT4(color.x, color.y, color.z, intensity);
-        light.Params = XMFLOAT4(2.f, std::cos(innerAngle), 0.f, 0.f);
+        light.Params = XMFLOAT4(static_cast<float>(LightSpot), std::cos(innerAngle), 0.f, 0.f);
         return light;
     };
 
     m_sceneLights.clear();
 
-    // Directional сини
-    m_sceneLights.push_back(makeDirectional(
-        XMFLOAT3(0.4f, -1.f, 0.3f),
-        XMFLOAT3(0.6f, 0.6f, 1.0f),
-        2.f));
+    // Directional слабый холодный свет сверху
+    m_sceneLights.push_back(makeDirectional(XMFLOAT3(0.4f, -1.f, 0.3f), XMFLOAT3(0.6f, 0.6f, 1.0f), 0.8f));
 
-    // point красни
-    m_sceneLights.push_back(makePoint(
-        XMFLOAT3(11.0f, 2.0f, -0.3f),
-        XMFLOAT3(1.0f, 0.1f, 0.1f),
-        3.5f, 4.5f));
-
-    // зелёный spot 
-    m_sceneLights.push_back(makeSpot(
-        XMFLOAT3(-10.f, 16.3f, -0.4f),
-        XMFLOAT3(0.6f, -1.0f, 0.f),
-        XMFLOAT3(0.2f, 1.0f, 0.2f),
-        7.0f, 19.0f, 7.0f, 19.0f));
+    // Point — разбросаны по первому этажу и галереям
+    m_sceneLights.push_back(makePoint(XMFLOAT3(11.0f, 2.0f, -0.3f), XMFLOAT3(1.0f, 0.1f, 0.1f), 3.5f, 4.5f));
+    m_sceneLights.push_back(makePoint(XMFLOAT3(-12.f, 1.5f, -4.f),  XMFLOAT3(1.0f, 0.55f, 0.15f), 3.f, 5.f));
+    m_sceneLights.push_back(makePoint(XMFLOAT3(-12.f, 1.5f, 3.5f),  XMFLOAT3(0.2f, 0.9f, 1.0f), 3.f, 5.f));
+    m_sceneLights.push_back(makePoint(XMFLOAT3(-4.f, 1.5f, -4.f),   XMFLOAT3(1.0f, 0.9f, 0.3f), 3.f, 5.f));
+    m_sceneLights.push_back(makePoint(XMFLOAT3(-4.f, 1.5f, 3.5f),   XMFLOAT3(1.0f, 0.3f, 0.9f), 3.f, 5.f));
+    m_sceneLights.push_back(makePoint(XMFLOAT3(4.f, 1.5f, -4.f),    XMFLOAT3(1.0f, 0.8f, 0.6f), 3.f, 5.f));
+    m_sceneLights.push_back(makePoint(XMFLOAT3(4.f, 1.5f, 3.5f),    XMFLOAT3(0.3f, 0.4f, 1.0f), 3.f, 5.f));
+    m_sceneLights.push_back(makePoint(XMFLOAT3(8.f, 6.5f, 5.f),     XMFLOAT3(0.4f, 1.0f, 0.4f), 3.f, 5.f));
+    m_sceneLights.push_back(makePoint(XMFLOAT3(-8.f, 6.5f, -5.f),   XMFLOAT3(1.0f, 0.5f, 0.2f), 3.f, 5.f));
+    // Spot
+    m_sceneLights.push_back(makeSpot(XMFLOAT3(-10.f, 16.3f, -0.4f), XMFLOAT3(0.6f, -1.0f, 0.f),
+        XMFLOAT3(0.2f, 1.0f, 0.2f), 7.0f, 19.0f, 7.0f, 19.0f));
+    m_sceneLights.push_back(makeSpot(XMFLOAT3(0.f, 12.f, 0.f), XMFLOAT3(0.f, -1.f, 0.f),
+        XMFLOAT3(1.0f, 0.95f, 0.8f), 5.0f, 16.0f, 12.0f, 22.0f));
+    m_sceneLights.push_back(makeSpot(XMFLOAT3(-16.f, 3.f, 0.f), XMFLOAT3(1.f, -0.3f, 0.f),
+        XMFLOAT3(1.0f, 0.4f, 0.1f), 6.0f, 14.0f, 10.0f, 18.0f));
 }
 
 void RenderingSystem::FlushCommandQueue()

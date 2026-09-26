@@ -67,13 +67,25 @@ private:
         DirectX::XMFLOAT4 Params{}; // x = type, y = cos(innerAngle)
     };
 
-    static constexpr uint32_t MaxLights = 32;
+    enum LightType : uint32_t { LightDirectional = 0, LightPoint = 1, LightSpot = 2 };
 
-    struct alignas(16) LightConstants
+    // Все источники кадра лежат в одном StructuredBuffer, отсортированные по типу
+    static constexpr uint32_t MaxLights = 4096;
+
+    // Root constants lighting-прохода (register b1)
+    struct LightPassConstants
     {
-        DirectX::XMFLOAT4 AmbientColor{ 0.05f, 0.05f, 0.06f, 1.f };
-        DirectX::XMFLOAT4 LightCount{ 0.f, 0.f, 0.f, 0.f };
-        GpuLight Lights[MaxLights]{};
+        DirectX::XMFLOAT4 AmbientColor{ 0.055f, 0.055f, 0.06f, 1.f };
+        uint32_t LightOffset = 0;
+        uint32_t Pad[3]{};
+    };
+
+    // Участок индексного буфера с мешем светового объёма
+    struct VolumeMesh
+    {
+        uint32_t IndexCount = 0;
+        uint32_t StartIndex = 0;
+        int32_t BaseVertex = 0;
     };
 
 private:
@@ -88,9 +100,10 @@ private:
     bool BuildPSOs();
     bool BuildGeometry();
     bool BuildFrameResources();
+    bool BuildLightVolumes();
 
     void UpdatePassConstants();
-    void UpdateLightConstants(float dt);
+    void UpdateLights(float dt);
     void CreateSceneLights();
 
     void FlushCommandQueue();
@@ -133,14 +146,20 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_ambientPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_directionalPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightVolumePSO;
 
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_lightingVS;
-    Microsoft::WRL::ComPtr<ID3DBlob> m_lightingPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_fullscreenVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_ambientPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_directionalPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_lightVolumeVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_lightVolumePS;
 
     D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
+    D3D12_INPUT_ELEMENT_DESC m_volumeInputLayout[1]{};
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vertexBuffer;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_indexBuffer;
@@ -151,11 +170,23 @@ private:
     std::vector<DrawItem> m_drawItems;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_passConstantBuffer;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_lightConstantBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_lightBuffer;
     uint8_t* m_mappedPassConstants = nullptr;
-    uint8_t* m_mappedLightConstants = nullptr;
+    GpuLight* m_mappedLights = nullptr;
+
+    // Световые объёмы: единичная сфера (point) и единичный конус (spot) в одном VB/IB
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_volumeVertexBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_volumeIndexBuffer;
+    D3D12_VERTEX_BUFFER_VIEW m_volumeVBView{};
+    D3D12_INDEX_BUFFER_VIEW m_volumeIBView{};
+    VolumeMesh m_sphereMesh;
+    VolumeMesh m_coneMesh;
 
     std::vector<GpuLight> m_sceneLights;
+    LightPassConstants m_lightPass;
+    uint32_t m_directionalCount = 0;
+    uint32_t m_pointCount = 0;
+    uint32_t m_spotCount = 0;
 
     DirectX::XMFLOAT4X4 m_world{};
     DirectX::XMFLOAT4X4 m_view{};
