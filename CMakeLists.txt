@@ -23,6 +23,11 @@ target_include_directories(dx12_textures PRIVATE include)
 # 3. Макросы Windows
 target_compile_definitions(dx12_textures PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+# Исходники в UTF-8 (русские строки в заголовке окна)
+if (MSVC)
+    target_compile_options(dx12_textures PRIVATE /utf-8)
+endif()
+
 # 4. Это GUI приложение
 set_target_properties(dx12_textures PROPERTIES WIN32_EXECUTABLE TRUE)
 

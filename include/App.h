@@ -31,4 +31,6 @@ private:
 
     POINT m_savedCursorPos{ 0, 0 };
     bool m_justEnteredRmbLook = false;
+
+    float m_titleTimer = 0.f;
 };

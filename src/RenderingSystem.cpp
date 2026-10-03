@@ -14,6 +14,7 @@ RenderingSystem::~RenderingSystem() = default;
 #include <unordered_map>
 #include <algorithm>
 #include <cctype>
+#include <random>
 #include <wincodec.h>
 #include <objbase.h>
 
@@ -704,6 +705,7 @@ bool RenderingSystem::Initialize(HWND hwnd, uint32_t width, uint32_t height)
     BuildGeometry();
     BuildLightVolumes();
     BuildFrameResources();
+    BuildLightGun();
 
     m_gBuffer = std::make_unique<GBuffer>();
     m_gBuffer->Initialize(m_device.Get(), m_width, m_height);
@@ -785,6 +787,7 @@ void RenderingSystem::Draw(float dt)
         return;
 
     UpdatePassConstants();
+    UpdateLightGun(dt);
     UpdateLights(dt);
 
     ThrowIfFailed(m_commandAllocator->Reset(), "Reset command allocator");
@@ -887,6 +890,16 @@ void RenderingSystem::Draw(float dt)
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // 3. HUD (прицел) и probe для пулемёта
+    // ---------------------------------------------------------------------------------
+    setLightOffset(0);
+    m_commandList->SetPipelineState(m_hudPSO.Get());
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+
+    if (m_probePending)
+        RecordProbePass();
+
     D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     toPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -899,6 +912,13 @@ void RenderingSystem::Draw(float dt)
     ThrowIfFailed(m_swapChain->Present(1, 0), "Present");
     m_backBufferIndex = (m_backBufferIndex + 1) % SwapChainBufferCount;
     FlushCommandQueue();
+
+    // GPU закончил кадр — результат probe уже лежит в readback-буфере
+    if (m_probePending)
+    {
+        ResolveProbe();
+        m_probePending = false;
+    }
 }
 
 void RenderingSystem::SetCamera(const XMFLOAT3& eyePos, float yaw, float pitch)
@@ -910,6 +930,7 @@ void RenderingSystem::SetCamera(const XMFLOAT3& eyePos, float yaw, float pitch)
     const float cp = std::cosf(pitch);
 
     const XMVECTOR forward = XMVector3Normalize(XMVectorSet(sy * cp, sp, cy * cp, 0.f));
+    XMStoreFloat3(&m_camForward, forward);
     XMStoreFloat4x4(
         &m_view,
         XMMatrixLookToLH(XMVectorSet(eyePos.x, eyePos.y, eyePos.z, 1.f), forward, XMVectorSet(0.f, 1.f, 0.f, 0.f)));
@@ -1021,6 +1042,8 @@ bool RenderingSystem::BuildShaders()
     compile("DirectionalPS", "ps_5_0", m_directionalPS);
     compile("LightVolumeVS", "vs_5_0", m_lightVolumeVS);
     compile("LightVolumePS", "ps_5_0", m_lightVolumePS);
+    compile("ProbePS", "ps_5_0", m_probePS);
+    compile("HudPS", "ps_5_0", m_hudPS);
 
     m_inputLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_inputLayout[1] = { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
@@ -1236,6 +1259,28 @@ bool RenderingSystem::BuildPSOs()
     volumePso.InputLayout = { m_volumeInputLayout, static_cast<UINT>(_countof(m_volumeInputLayout)) };
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&volumePso, IID_PPV_ARGS(&m_lightVolumePSO)), "Create light volume PSO");
 
+    // HUD: полноэкранный треугольник поверх кадра, обычный alpha blending
+    D3D12_BLEND_DESC alphaBlend = blend;
+    alphaBlend.RenderTarget[0].BlendEnable = TRUE;
+    alphaBlend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    alphaBlend.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    alphaBlend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC hudPso = fullscreenPso;
+    hudPso.PS = { m_hudPS->GetBufferPointer(), m_hudPS->GetBufferSize() };
+    hudPso.BlendState = alphaBlend;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&hudPso, IID_PPV_ARGS(&m_hudPSO)), "Create HUD PSO");
+
+    // Probe: 2 RT 1x1 формата RGBA32F (позиция попадания и нормаль), без depth
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC probePso = fullscreenPso;
+    probePso.PS = { m_probePS->GetBufferPointer(), m_probePS->GetBufferSize() };
+    probePso.BlendState = blend;
+    probePso.NumRenderTargets = 2;
+    probePso.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    probePso.RTVFormats[1] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    probePso.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&probePso, IID_PPV_ARGS(&m_probePSO)), "Create probe PSO");
+
     return true;
 }
 
@@ -1438,8 +1483,6 @@ bool RenderingSystem::BuildLightVolumes()
     std::vector<XMFLOAT3> vertices;
     std::vector<uint32_t> indices;
 
-    // Добавляет треугольник так, чтобы снаружи он был CW (cross(b-a, c-a) смотрит наружу).
-    // interior — любая точка внутри выпуклого меша.
     auto addTriangle = [&](uint32_t base, uint32_t i0, uint32_t i1, uint32_t i2, const XMFLOAT3& interior)
     {
         const XMVECTOR a = XMLoadFloat3(&vertices[base + i0]);
@@ -1501,7 +1544,7 @@ bool RenderingSystem::BuildLightVolumes()
         m_sphereMesh.IndexCount = static_cast<uint32_t>(indices.size()) - m_sphereMesh.StartIndex;
     }
 
-    // --- Конус: вершина в (0,0,0), ось +Z, длина 1, радиус основания 1 (с запасом на полигональность)
+    // Конус: вершина в (0,0,0), ось +Z, длина 1, радиус основания 1 (с запасом на полигональность)
     {
         const uint32_t segments = 16;
         const float radius = 1.f / std::cos(XM_PI / static_cast<float>(segments)) * 1.03f;
@@ -1593,8 +1636,6 @@ void RenderingSystem::UpdateLights(float dt)
 
     m_time += dt;
 
-    // Раскладываем источники в GPU-буфер группами: [directional][point][spot].
-    // Каждая группа потом рисуется одним instanced draw call.
     uint32_t written = 0;
     uint32_t counts[3] = { 0, 0, 0 };
 
@@ -1614,6 +1655,27 @@ void RenderingSystem::UpdateLights(float dt)
 
             m_mappedLights[written++] = light;
             ++counts[type];
+        }
+
+        // Пули и следы пулемёта - point light
+        if (type == LightPoint)
+        {
+            auto pushPoint = [&](const XMFLOAT3& pos, const XMFLOAT3& color, float intensity, float range)
+            {
+                if (written >= MaxLights)
+                    return;
+                GpuLight light{};
+                light.PositionRange = XMFLOAT4(pos.x, pos.y, pos.z, range);
+                light.ColorIntensity = XMFLOAT4(color.x, color.y, color.z, intensity);
+                light.Params = XMFLOAT4(static_cast<float>(LightPoint), 0.f, 0.f, 0.f);
+                m_mappedLights[written++] = light;
+                ++counts[LightPoint];
+            };
+
+            for (const Projectile& p : m_projectiles)
+                pushPoint(p.Pos, p.Color, 4.f, 3.f);
+            for (const LightMark& m : m_lightMarks)
+                pushPoint(m.Pos, m.Color, 1.6f, 1.3f);
         }
     }
 
@@ -1669,7 +1731,7 @@ void RenderingSystem::CreateSceneLights()
     // Directional слабый холодный свет сверху
     m_sceneLights.push_back(makeDirectional(XMFLOAT3(0.4f, -1.f, 0.3f), XMFLOAT3(0.6f, 0.6f, 1.0f), 0.8f));
 
-    // Point — разбросаны по первому этажу и галереям
+    // Point разбросаны по первому этажу и галереям
     m_sceneLights.push_back(makePoint(XMFLOAT3(11.0f, 2.0f, -0.3f), XMFLOAT3(1.0f, 0.1f, 0.1f), 3.5f, 4.5f));
     m_sceneLights.push_back(makePoint(XMFLOAT3(-12.f, 1.5f, -4.f),  XMFLOAT3(1.0f, 0.55f, 0.15f), 3.f, 5.f));
     m_sceneLights.push_back(makePoint(XMFLOAT3(-12.f, 1.5f, 3.5f),  XMFLOAT3(0.2f, 0.9f, 1.0f), 3.f, 5.f));
@@ -1686,6 +1748,200 @@ void RenderingSystem::CreateSceneLights()
         XMFLOAT3(1.0f, 0.95f, 0.8f), 5.0f, 16.0f, 12.0f, 22.0f));
     m_sceneLights.push_back(makeSpot(XMFLOAT3(-16.f, 3.f, 0.f), XMFLOAT3(1.f, -0.3f, 0.f),
         XMFLOAT3(1.0f, 0.4f, 0.1f), 6.0f, 14.0f, 10.0f, 18.0f));
+}
+
+//  ДОП. ЗАДАНИЕ: пулемёт лампочками
+//
+//  Пока зажат пробел, 12 раз в секунду:
+//   1) в кадре дописывается probe pass — пиксельный шейдер в RT 1x1 читает центральный
+//      пиксель G-buffer-а и восстанавливает точку, куда смотрит камера (GPU-«луч»);
+//   2) после кадра CPU читает этот пиксель из readback-буфера;
+//   3) из камеры вылетает «пуля» — движущийся point light, который по дороге освещает сцену;
+//   4) долетев до точки попадания, пуля превращается в неподвижный point light — след.
+//  Все пули и следы — обычные point light-ы deferred-рендера (сфера-объём на каждый).
+
+bool RenderingSystem::BuildLightGun()
+{
+    auto defaultHeap = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto readbackHeap = HeapProps(D3D12_HEAP_TYPE_READBACK);
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
+    rtvHeapDesc.NumDescriptors = 2;
+    rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    ThrowIfFailed(m_device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_probeRtvHeap)), "Create probe RTV heap");
+
+    D3D12_RESOURCE_DESC desc = TextureDesc2D(1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_probeRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    for (auto& target : m_probeTargets)
+    {
+        ThrowIfFailed(
+            m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&target)),
+            "Create probe target");
+        m_device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+        rtv.ptr += m_rtvDescriptorSize;
+    }
+
+    // Два пикселя по 16 байт, каждый со смещением, кратным D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT (512)
+    const D3D12_RESOURCE_DESC readbackDesc = BufferDesc(2 * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    ThrowIfFailed(
+        m_device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_probeReadback)),
+        "Create probe readback buffer");
+    return true;
+}
+
+void RenderingSystem::UpdateLightGun(float dt)
+{
+    // Темп стрельбы
+    m_fireCooldown = std::max(m_fireCooldown - dt, 0.f);
+    if (m_firing && m_fireCooldown <= 0.f)
+    {
+        m_probePending = true;
+        m_fireCooldown = FireInterval;
+    }
+
+    // Полёт пуль
+    for (size_t i = 0; i < m_projectiles.size();)
+    {
+        Projectile& p = m_projectiles[i];
+        const XMVECTOR pos = XMLoadFloat3(&p.Pos);
+        const XMVECTOR toTarget = XMVectorSubtract(XMLoadFloat3(&p.Target), pos);
+        const float dist = XMVectorGetX(XMVector3Length(toTarget));
+        const float step = ProjectileSpeed * dt;
+
+        if (step < dist)
+        {
+            XMStoreFloat3(&p.Pos, XMVectorAdd(pos, XMVectorScale(toTarget, step / dist)));
+            ++i;
+            continue;
+        }
+
+        // Долетела
+        if (p.HasHit)
+        {
+            m_lightMarks.push_back({ p.Target, p.Color });
+            while (m_lightMarks.size() > MaxMarks)
+                m_lightMarks.pop_front();
+        }
+        m_projectiles[i] = m_projectiles.back();
+        m_projectiles.pop_back();
+    }
+}
+
+void RenderingSystem::RecordProbePass()
+{
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    for (int i = 0; i < 2; ++i)
+    {
+        barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[i].Transition.pResource = m_probeTargets[i].Get();
+        barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    m_commandList->ResourceBarrier(2, barriers);
+
+    // Разброс: луч идёт не ровно в центр, а в случайную точку круга вокруг прицела
+    static std::mt19937 rng{ 1337u };
+    std::uniform_real_distribution<float> uniform(0.f, 1.f);
+    const float radius = SpreadFraction * static_cast<float>(m_height) * std::sqrt(uniform(rng));
+    const float angle = XM_2PI * uniform(rng);
+    m_lightPass.ProbeJitter = XMFLOAT2(radius * std::cos(angle), radius * std::sin(angle));
+    m_commandList->SetGraphicsRoot32BitConstants(3, sizeof(LightPassConstants) / 4, &m_lightPass, 0);
+
+    // Рисуем в 1x1: шейдер сам берёт пиксель G-buffer-а у прицела (G-buffer и PassCB уже привязаны)
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_probeRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_VIEWPORT viewport{ 0.f, 0.f, 1.f, 1.f, 0.f, 1.f };
+    const D3D12_RECT scissor{ 0, 0, 1, 1 };
+    m_commandList->OMSetRenderTargets(2, &rtv, TRUE, nullptr);
+    m_commandList->RSSetViewports(1, &viewport);
+    m_commandList->RSSetScissorRects(1, &scissor);
+    m_commandList->SetPipelineState(m_probePSO.Get());
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+
+    for (auto& barrier : barriers)
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    m_commandList->ResourceBarrier(2, barriers);
+
+    // Копируем оба пикселя в readback-буфер, чтобы прочитать их на CPU
+    for (UINT i = 0; i < 2; ++i)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = m_probeReadback.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = i * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT };
+
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = m_probeTargets[i].Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+
+        m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    m_commandList->RSSetViewports(1, &m_viewport);
+    m_commandList->RSSetScissorRects(1, &m_scissorRect);
+}
+
+void RenderingSystem::ResolveProbe()
+{
+    XMFLOAT4 hit{};
+    XMFLOAT4 normal{};
+
+    uint8_t* mapped = nullptr;
+    const D3D12_RANGE readRange{ 0, 2 * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT };
+    ThrowIfFailed(m_probeReadback->Map(0, &readRange, reinterpret_cast<void**>(&mapped)), "Map probe readback");
+    std::memcpy(&hit, mapped, sizeof(hit));
+    std::memcpy(&normal, mapped + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, sizeof(normal));
+    const D3D12_RANGE writeRange{ 0, 0 };
+    m_probeReadback->Unmap(0, &writeRange);
+
+    ++m_shotCount;
+
+    // Цвет пули
+    const float hue = std::fmod(static_cast<float>(m_shotCount) * 0.618034f, 1.f) * 6.f;
+    const float x = 1.f - std::fabs(std::fmod(hue, 2.f) - 1.f);
+    XMFLOAT3 color{};
+    switch (static_cast<int>(hue))
+    {
+    case 0: color = { 1.f, x, 0.f }; break;
+    case 1: color = { x, 1.f, 0.f }; break;
+    case 2: color = { 0.f, 1.f, x }; break;
+    case 3: color = { 0.f, x, 1.f }; break;
+    case 4: color = { x, 0.f, 1.f }; break;
+    default: color = { 1.f, 0.f, x }; break;
+    }
+
+    const XMVECTOR eye = XMLoadFloat3(&m_eyePos);
+    const XMVECTOR forward = XMLoadFloat3(&m_camForward);
+
+    Projectile p{};
+    p.Color = color;
+    // Стартуем чуть впереди и ниже камеры — как из ствола
+    XMStoreFloat3(&p.Pos, XMVectorAdd(eye, XMVectorAdd(XMVectorScale(forward, 0.6f), XMVectorSet(0.f, -0.25f, 0.f, 0.f))));
+
+    if (hit.w > 0.5f)
+    {
+        // Нормаль разворачиваем к камере и отодвигаем след от поверхности:
+        // свет, лежащий прямо на стене, почти не освещает её (N·L ≈ 0)
+        XMVECTOR n = XMVector3Normalize(XMLoadFloat4(&normal));
+        const XMVECTOR hitPos = XMVectorSetW(XMLoadFloat4(&hit), 0.f);
+        if (XMVectorGetX(XMVector3Dot(n, XMVectorSubtract(eye, hitPos))) < 0.f)
+            n = XMVectorNegate(n);
+
+        XMStoreFloat3(&p.Target, XMVectorAdd(hitPos, XMVectorScale(n, 0.2f)));
+        p.HasHit = true;
+    }
+    else
+    {
+        // Луч ушёл в небо: пуля улетает и исчезает, следа нет
+        XMStoreFloat3(&p.Target, XMVectorAdd(eye, XMVectorScale(forward, 80.f)));
+        p.HasHit = false;
+    }
+
+    m_projectiles.push_back(p);
 }
 
 void RenderingSystem::FlushCommandQueue()

@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <deque>
 
 class GBuffer;
 
@@ -35,6 +36,11 @@ public:
     void OnResize(uint32_t width, uint32_t height);
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
+
+    // Доп. задание: пулемёт лампочками
+    void SetFiring(bool firing) { m_firing = firing; }
+    uint32_t GetShotCount() const { return m_shotCount; }
+    uint32_t GetMarkCount() const { return static_cast<uint32_t>(m_lightMarks.size()); }
 private:
     struct MaterialConstants
     {
@@ -77,10 +83,27 @@ private:
     {
         DirectX::XMFLOAT4 AmbientColor{ 0.055f, 0.055f, 0.06f, 1.f };
         uint32_t LightOffset = 0;
-        uint32_t Pad[3]{};
+        uint32_t Pad = 0;
+        DirectX::XMFLOAT2 ProbeJitter{ 0.f, 0.f }; // разброс пулемёта в пикселях
     };
 
     // Участок индексного буфера с мешем светового объёма
+    // Летящая «пуля»-лампочка: point light, движущийся от камеры к точке попадания
+    struct Projectile
+    {
+        DirectX::XMFLOAT3 Pos{};
+        DirectX::XMFLOAT3 Target{};
+        DirectX::XMFLOAT3 Color{};
+        bool HasHit = false;         // долетев, оставит след (если луч попал в геометрию)
+    };
+
+    // След от попадания: неподвижный point light у поверхности
+    struct LightMark
+    {
+        DirectX::XMFLOAT3 Pos{};
+        DirectX::XMFLOAT3 Color{};
+    };
+
     struct VolumeMesh
     {
         uint32_t IndexCount = 0;
@@ -101,6 +124,11 @@ private:
     bool BuildGeometry();
     bool BuildFrameResources();
     bool BuildLightVolumes();
+    bool BuildLightGun();
+
+    void UpdateLightGun(float dt);
+    void RecordProbePass();
+    void ResolveProbe();
 
     void UpdatePassConstants();
     void UpdateLights(float dt);
@@ -194,4 +222,28 @@ private:
     DirectX::XMFLOAT3 m_eyePos{ -5.f, 1.f, -5.f };
 
     float m_time = 0.f;
+
+    // ---- Доп. задание: пулемёт лампочками ----
+    static constexpr float FireInterval = 1.f / 12.f;  // 12 выстрелов в секунду
+    static constexpr float ProjectileSpeed = 60.f;
+    static constexpr float SpreadFraction = 0.025f;    // радиус разброса = 2.5% высоты экрана
+    static constexpr uint32_t MaxMarks = MaxLights - 128;
+
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_probePSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_hudPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_probePS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_hudPS;
+
+    // Probe: 2 render target-а 1x1 (позиция попадания, нормаль) + readback-буфер для CPU
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_probeTargets[2];
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_probeRtvHeap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_probeReadback;
+
+    DirectX::XMFLOAT3 m_camForward{ 0.f, 0.f, 1.f };
+    bool m_firing = false;
+    bool m_probePending = false;     // в этом кадре записан probe, после кадра прочитать результат
+    float m_fireCooldown = 0.f;
+    uint32_t m_shotCount = 0;
+    std::vector<Projectile> m_projectiles;
+    std::deque<LightMark> m_lightMarks;
 };

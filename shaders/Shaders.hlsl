@@ -12,10 +12,10 @@ cbuffer LightPassCB : register(b1)
 {
     float4 gAmbientColor;   // rgb = ambient
     uint   gLightOffset;    // индекс первого источника в gLights для текущего draw call
-    uint3  gLightPassPad;
+    uint   gLightPassPad;
+    float2 gProbeJitter;    // смещение луча от центра экрана в пикселях
 };
 
-// Root constants для geometry-прохода (материал текущего draw item)
 cbuffer MaterialCB : register(b2)
 {
     float4 gBaseColor;      // rgb = diffuse tint,  a unused
@@ -25,10 +25,10 @@ cbuffer MaterialCB : register(b2)
 Texture2D    gDiffuseMap : register(t0);
 SamplerState gSampler    : register(s0);
 
-// G-buffer (читается в lighting-проходе)
+// G-buffer
 Texture2D gAlbedoSpecTex : register(t1);
 Texture2D gNormalTex     : register(t2);
-Texture2D gDepthTex      : register(t3);   // SRV на тот же depth buffer, что писался в geometry pass
+Texture2D gDepthTex      : register(t3);
 
 #define LIGHT_DIRECTIONAL 0
 #define LIGHT_POINT       1
@@ -42,10 +42,7 @@ struct GpuLight
     float4 Params;          // x = type (0=dir, 1=point, 2=spot), y = cos(innerAngle)
 };
 
-// Все источники лежат в одном structured buffer, отсортированные по типу:
-// [directional...][point...][spot...]. gLightOffset указывает начало нужной группы.
 StructuredBuffer<GpuLight> gLights : register(t4);
-
 //geometry pass
 struct VSIn
 {
@@ -83,7 +80,7 @@ GBufferOut GeometryPS(GeoVSOut pin)
 
     float3 albedo = gDiffuseMap.Sample(gSampler, pin.TexC).rgb * gBaseColor.rgb;
 
-    // Тут нет ни одного источника света — только «что это за поверхность»
+    //что это за поверхность
     gout.AlbedoSpec = float4(albedo, gSurfaceParams.x);
     gout.Normal     = float4(normalize(pin.NormalW), gSurfaceParams.y);
     return gout;
@@ -127,7 +124,6 @@ bool LoadSurface(float4 svPosition, out Surface s)
     return depth < 1.f;
 }
 
-// Blinn-Phong для одного источника
 float3 EvaluateLight(GpuLight light, Surface s)
 {
     float3 L;
@@ -255,4 +251,40 @@ float4 LightVolumePS(VolumeVSOut pin) : SV_TARGET
     if (!LoadSurface(pin.PosH, s))
         discard;
     return float4(EvaluateLight(gLights[pin.LightIndex], s), 1.f);
+}
+
+//  ДОП. ЗАДАНИЕ: «пулемёт лампочками»
+//  Probe pass — GPU-«луч» из центра экрана.
+//  Рисуется в render target 1×1. Пиксельный шейдер берёт центральный пиксель G-buffer-а,
+//  восстанавливает его мировую позицию из глубины и отдаёт позицию + нормаль.
+//  CPU копирует этот 1 пиксель в readback-буфер и узнаёт, куда попала «пуля».
+struct ProbeOut
+{
+    float4 PosValid : SV_Target0;   // xyz = точка попадания, w = 1 если попали в геометрию
+    float4 Normal   : SV_Target1;   // xyz = нормаль поверхности
+};
+
+ProbeOut ProbePS(FullscreenVSOut pin)
+{
+    float2 center = clamp(floor(gRTSize.xy * 0.5f + gProbeJitter), 0.f, gRTSize.xy - 1.f) + 0.5f;
+
+    Surface s;
+    bool hit = LoadSurface(float4(center, 0.f, 1.f), s);
+
+    ProbeOut o;
+    o.PosValid = float4(s.PosW, hit ? 1.f : 0.f);
+    o.Normal   = float4(s.N, 0.f);
+    return o;
+}
+
+//  HUD прицел
+float4 HudPS(FullscreenVSOut pin) : SV_TARGET
+{
+    float2 d = abs(pin.PosH.xy - gRTSize.xy * 0.5f);
+    bool crosshair = (d.x < 1.5f && d.y > 4.f && d.y < 12.f)
+                  || (d.y < 1.5f && d.x > 4.f && d.x < 12.f)
+                  || (d.x < 1.5f && d.y < 1.5f);
+    if (!crosshair)
+        discard;
+    return float4(1.f, 1.f, 1.f, 0.9f);
 }

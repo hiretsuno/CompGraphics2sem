@@ -19,6 +19,10 @@ public:
     void Draw(float dt);
     void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
 
+    void SetFiring(bool firing);
+    uint32_t GetShotCount() const;
+    uint32_t GetMarkCount() const;
+
 private:
     std::unique_ptr<RenderingSystem> m_renderer;
 };

@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <cstdio>
 #include <DirectXMath.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -113,6 +114,19 @@ void App::Update(float dt)
     }
 
     m_dx12->SetCamera(m_camPos, m_camYaw, m_camPitch);
+
+    // Пулемёт лампочками: стреляем, пока зажат пробел
+    m_dx12->SetFiring(m_input->IsKeyDown(VK_SPACE));
+
+    m_titleTimer += dt;
+    if (m_titleTimer >= 0.25f)
+    {
+        m_titleTimer = 0.f;
+        wchar_t title[128];
+        swprintf_s(title, L"Lab-2 | Deferred | Лучей: %u | (Space)",
+            m_dx12->GetShotCount(), m_dx12->GetMarkCount());
+        SetWindowTextW(m_window->GetHwnd(), title);
+    }
 }
 
 LRESULT App::HandleWindowMessage(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)

@@ -36,3 +36,19 @@ void D3D12Context::SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float p
     if (m_renderer)
         m_renderer->SetCamera(eyePos, yaw, pitch);
 }
+
+void D3D12Context::SetFiring(bool firing)
+{
+    if (m_renderer)
+        m_renderer->SetFiring(firing);
+}
+
+uint32_t D3D12Context::GetShotCount() const
+{
+    return m_renderer ? m_renderer->GetShotCount() : 0;
+}
+
+uint32_t D3D12Context::GetMarkCount() const
+{
+    return m_renderer ? m_renderer->GetMarkCount() : 0;
+}
