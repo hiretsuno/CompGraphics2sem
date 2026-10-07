@@ -1,0 +1,11 @@
+# Blender 5.2.1 LTS MTL File: 'namaqualand_cliff_02_4k.blend'
+# www.blender.org
+
+newmtl namaqualand_cliff_02
+Ka 1.000000 1.000000 1.000000
+Ks 0.500000 0.500000 0.500000
+d 1.000000
+illum 2
+map_Kd textures/namaqualand_cliff_02_diff_4k.png
+map_Bump textures/namaqualand_cliff_02_nor_dx_4k.png
+disp textures/namaqualand_cliff_02_disp_4k.png

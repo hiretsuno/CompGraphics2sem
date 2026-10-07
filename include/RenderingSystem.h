@@ -1,0 +1,224 @@
+#pragma once
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <wrl.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <d3dcompiler.h>
+#include <DirectXMath.h>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+class GBuffer;
+class ShadowMap;
+class ParticleSystem;
+
+class RenderingSystem
+{
+public:
+    RenderingSystem();
+    ~RenderingSystem();
+    struct Vertex
+    {
+        DirectX::XMFLOAT3 Pos;
+        DirectX::XMFLOAT3 Normal;
+        DirectX::XMFLOAT2 TexC;
+    };
+
+    bool Initialize(HWND hwnd, uint32_t width, uint32_t height);
+    void Shutdown();
+
+    void OnResize(uint32_t width, uint32_t height);
+    void Draw(float dt);
+    void SetCamera(const DirectX::XMFLOAT3& eyePos, float yaw, float pitch);
+    void SetPostEffects(bool vignette, bool chroma, int debugView);   // debugView: 0=off, 1=albedo, 2=normal, 3=depth, 4=material (R=metallic G=roughness B=ao)
+    void SetPbrDebug(int materialOverride, bool iblOn, bool directOn);   // для проверки PBR/IBL, см. F4..F6 в App
+
+private:
+    struct MaterialConstants
+    {
+        DirectX::XMFLOAT4 BaseColor{ 1.f, 1.f, 1.f, 1.f };
+        DirectX::XMFLOAT4 SurfaceParams{ 0.f, 0.5f, 1.f, 0.f };   // x = metallic, y = roughness, z = ao (константы, если нет текстур)
+    };
+
+    struct DrawItem
+    {
+        uint32_t IndexCount = 0;
+        uint32_t StartIndexLocation = 0;
+        uint32_t TextureIndex = 0;    // albedo в m_textureHeap (0 = белая заглушка)
+        uint32_t NormalIndex = 1;     // normal map в m_textureHeap (1 = плоская нормаль (0,0,1))
+        uint32_t MetalRoughIndex = 2; // map_MR: G=roughness, B=metallic (2 = (_,1,1) — обе константы проходят как есть)
+        MaterialConstants Material;
+    };
+
+    struct alignas(16) PassConstants
+    {
+        DirectX::XMFLOAT4X4 World{};
+        DirectX::XMFLOAT4X4 ViewProj{};
+        DirectX::XMFLOAT4X4 InvViewProj{};
+        DirectX::XMFLOAT4 EyePosW{ 0.f, 0.f, 0.f, 1.f };
+        DirectX::XMFLOAT4 RenderTargetSize{ 1.f, 1.f, 1.f, 1.f }; // x = width, y = height, z = 1/width, w = 1/height
+    };
+
+    struct alignas(16) GpuLight
+    {
+        DirectX::XMFLOAT4 PositionRange{}; // xyz = position, w = range
+        DirectX::XMFLOAT4 DirectionSpot{}; // xyz = direction, w = cos(outerAngle)
+        DirectX::XMFLOAT4 ColorIntensity{}; // rgb = color, a = intensity
+        DirectX::XMFLOAT4 Params{}; // x = type, y = cos(innerAngle)
+    };
+
+    // Должна совпадать с cbuffer PostCB в PostProcessPS.hlsl.
+    struct alignas(16) PostConstants
+    {
+        DirectX::XMFLOAT4 RenderTargetSize{ 1.f, 1.f, 1.f, 1.f };
+        DirectX::XMFLOAT4 Vignette{ 0.75f, 0.35f, 0.f, 0.f }; // x = intensity, y = radius (где начинается затемнение)
+        DirectX::XMFLOAT4 Chroma{ 0.006f, 0.f, 0.f, 0.f };    // x = strength (UV)
+        DirectX::XMFLOAT4 Flags{ 1.f, 1.f, 0.f, 0.f };        // vignette, chroma, unused, debug view (0..3)
+    };
+
+    static constexpr uint32_t MaxLights = 32;
+
+    struct alignas(16) LightConstants
+    {
+        // x = подмена материала (0 = из G-buffer, 1 = хром, 2 = шероховатый диэлектрик, 3 = глянцевый диэлектрик),
+        // y = IBL-ambient вкл/выкл, z = прямой свет вкл/выкл
+        DirectX::XMFLOAT4 PbrDebug{ 0.f, 1.f, 1.f, 0.f };
+        DirectX::XMFLOAT4 LightCount{ 0.f, 0.f, 0.f, 0.f };
+        GpuLight Lights[MaxLights]{};
+    };
+
+private:
+    bool CreateDevice();
+    bool CreateCommandObjects();
+    bool CreateSwapChain();
+    bool CreateBackBufferHeap();
+    bool CreateBackBufferRTVs();
+
+    bool BuildShaders();
+    bool BuildRootSignature();
+    bool BuildPSOs();
+    bool BuildPostRootSignature();
+    void CreateSceneColor();   // RT для lighting/particles + его SRV в куче GBuffer
+    bool BuildGeometry();
+    bool BuildIblResources();   // irradiance / prefiltered env / BRDF LUT + их SRV в куче GBuffer
+    bool BuildFrameResources();
+
+    void UpdatePassConstants();
+    void UpdateLightConstants(float dt);
+    void CreateSceneLights();
+
+    void FlushCommandQueue();
+
+    D3D12_CPU_DESCRIPTOR_HANDLE CurrentBackBufferRTV() const;
+    ID3D12Resource* CurrentBackBuffer() const;
+
+private:
+    static constexpr uint32_t SwapChainBufferCount = 2;
+
+    // Параметры камеры (нужны и для proj, и для расчёта каскадов).
+    static constexpr float kFovY = 0.25f * DirectX::XM_PI;
+    static constexpr float kNearZ = 0.05f;
+    static constexpr float kFarZ = 200.f;
+    static constexpr float kShadowDistance = 60.f;   // до какого расстояния от камеры строим тени
+
+    bool m_initialized = false;
+    HWND m_hwnd = nullptr;
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
+
+    Microsoft::WRL::ComPtr<IDXGIFactory4> m_factory;
+    Microsoft::WRL::ComPtr<ID3D12Device> m_device;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_commandQueue;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_commandAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
+
+    Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
+    uint64_t m_fenceValue = 0;
+    HANDLE m_fenceEvent = nullptr;
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain> m_swapChain;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_backBuffers[SwapChainBufferCount];
+    uint32_t m_backBufferIndex = 0;
+
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_backBufferRtvHeap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_textureHeap;
+
+    uint32_t m_rtvDescriptorSize = 0;
+    uint32_t m_srvDescriptorSize = 0;
+
+    D3D12_VIEWPORT m_viewport{};
+    D3D12_RECT m_scissorRect{};
+
+    std::unique_ptr<GBuffer> m_gBuffer;
+    std::unique_ptr<ShadowMap> m_shadowMap;   // CSM: Texture2DArray глубины
+    std::unique_ptr<ParticleSystem> m_particles;   // GPU-частицы (Append/Consume ping-pong)
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightingPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowPSO;   // depth-only проход в каскады
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_particlePSO; // частицы: VS + GS + PS, POINTLIST
+
+    // Post-process: полноэкранный треугольник, читает SceneColor + G-Buffer, пишет в back buffer.
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_postRootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_postPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_postVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_postPS;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_sceneColor;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_sceneRtvHeap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_postConstantBuffer;
+    uint8_t* m_mappedPostConstants = nullptr;
+    PostConstants m_post;   // CPU-копия параметров эффектов
+
+    Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_lightingVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_lightingPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_shadowVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleVS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particleGS;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_particlePS;
+
+    D3D12_INPUT_ELEMENT_DESC m_inputLayout[3]{};
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_vertexBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_indexBuffer;
+    D3D12_VERTEX_BUFFER_VIEW m_vertexBufferView{};
+    D3D12_INDEX_BUFFER_VIEW m_indexBufferView{};
+
+    // IBL (лекция, split-sum): t5 / t6 / t7 в lighting-шейдере
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_irradianceMap;   // TextureCube, диффузная часть
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_prefilterMap;    // TextureCube + mips, зеркальная часть
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_brdfLut;         // Texture2D RG, интеграл BRDF
+
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_textures;
+    std::vector<DrawItem> m_drawItems;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_passConstantBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_lightConstantBuffer;
+    uint8_t* m_mappedPassConstants = nullptr;
+    uint8_t* m_mappedLightConstants = nullptr;
+
+    std::vector<GpuLight> m_sceneLights;
+
+    DirectX::XMFLOAT4X4 m_world{};
+    DirectX::XMFLOAT4X4 m_view{};
+    DirectX::XMFLOAT4X4 m_proj{};
+    DirectX::XMFLOAT3 m_eyePos{ -30.f, 25.f, -30.f };
+
+    // Направление, КУДА светит солнце (от источника к сцене).
+    DirectX::XMFLOAT3 m_sunDir{ 0.15f, -0.96f, 0.22f };
+
+    float m_time = 0.f;
+
+    int  m_pbrOverride = 0;
+    bool m_iblOn = true;
+    bool m_directOn = true;
+};

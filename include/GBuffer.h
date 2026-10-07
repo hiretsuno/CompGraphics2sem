@@ -1,0 +1,78 @@
+#pragma once
+
+#include <wrl.h>
+#include <d3d12.h>
+#include <cstdint>
+
+class GBuffer
+{
+public:
+    // 0 = albedo, 1 = normal, 2 = depth, 3 = material (r = metallic, g = roughness, b = ao)
+    static constexpr uint32_t TargetCount = 4;
+
+    bool Initialize(ID3D12Device* device, uint32_t width, uint32_t height);
+    void Shutdown();
+    void Resize(ID3D12Device* device, uint32_t width, uint32_t height);
+
+    void TransitionToWrite(ID3D12GraphicsCommandList* cmdList);
+    void TransitionToRead(ID3D12GraphicsCommandList* cmdList);
+    void BindForGeometryPass(ID3D12GraphicsCommandList* cmdList);
+
+    ID3D12DescriptorHeap* GetSrvHeap() const { return m_srvHeap.Get(); }
+    D3D12_GPU_DESCRIPTOR_HANDLE GetSrvTable() const { return m_srvHeap->GetGPUDescriptorHandleForHeapStart(); }
+    D3D12_CPU_DESCRIPTOR_HANDLE GetDsv() const { return m_dsvHeap->GetCPUDescriptorHandleForHeapStart(); }
+
+    // Лишний слот в SRV-куче (сразу после G-buffer) — под SRV карты теней.
+    // Так lighting pass читает всё из одной кучи.
+    D3D12_CPU_DESCRIPTOR_HANDLE GetShadowSrvCpu() const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(TargetCount) * m_srvDescriptorSize;
+        return h;
+    }
+
+    // Ещё один слот (после shadow map) — SRV SceneColor для post-process прохода.
+    D3D12_CPU_DESCRIPTOR_HANDLE GetSceneColorSrvCpu() const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(TargetCount + 1) * m_srvDescriptorSize;
+        return h;
+    }
+
+    // Слоты 6..8 — IBL: 0 = irradiance (cube), 1 = prefiltered env (cube + mips), 2 = BRDF LUT (2D).
+    // Кучу Resize не пересоздаёт, так что эти дескрипторы переживают изменение размера окна.
+    static constexpr uint32_t IblFirstSlot = TargetCount + 2;
+    static constexpr uint32_t IblCount = 3;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE GetIblSrvCpu(uint32_t index) const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(IblFirstSlot + index) * m_srvDescriptorSize;
+        return h;
+    }
+
+    DXGI_FORMAT GetAlbedoSpecFormat() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
+    DXGI_FORMAT GetNormalFormat() const { return DXGI_FORMAT_R16G16B16A16_FLOAT; }
+    DXGI_FORMAT GetDepthValueFormat() const { return DXGI_FORMAT_R32_FLOAT; }
+    DXGI_FORMAT GetMaterialFormat() const { return DXGI_FORMAT_R8G8B8A8_UNORM; }
+    DXGI_FORMAT GetDepthStencilFormat() const { return DXGI_FORMAT_D32_FLOAT; }
+
+private:
+    void CreateResources(ID3D12Device* device);
+    void ReleaseResources();
+
+private:
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
+    uint32_t m_rtvDescriptorSize = 0;
+    uint32_t m_srvDescriptorSize = 0;
+
+    bool m_isWriteState = false;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_targets[TargetCount];
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_depthStencil;
+
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_rtvHeap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_srvHeap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_dsvHeap;
+};

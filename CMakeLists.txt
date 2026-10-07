@@ -12,6 +12,12 @@ add_executable(dx12_textures
         src/Window.cpp
         src/Input.cpp
         src/D3D12Context.cpp
+        src/GBuffer.cpp
+        src/ShadowMap.cpp
+        src/ParticleSystem.cpp
+        src/RenderingSystem.cpp
+        src/Frustum.cpp
+        src/Octree.cpp
 )
 
 # 2. Заголовки (.h) — ищем в папке include
